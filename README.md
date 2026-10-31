@@ -1,5 +1,77 @@
 This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
 
+# Environment configuration
+
+1. Copy `.env.example` to `.env` in the project root.
+2. Set `SUPABASE_URL` and `SUPABASE_ANON_KEY` to your Supabase project URL and publishable/anon key.
+3. Keep `.env` local; it is ignored by Git. Never put a Supabase secret or service-role key in the mobile app because app values can be extracted from a build.
+4. Rebuild the native app after changing environment values. Metro reload alone does not update native configuration.
+
+Android reads `.env` through `react-native-config`. On iOS, install native dependencies with `cd ios && pod install` on macOS before building. For another environment file, set `ENVFILE` when building (for example, `ENVFILE=.env.staging`).
+
+## Field reports
+
+The field-report upload pipeline in this technical test is Android-native. Android is the required platform in the brief; the iOS app does not yet have an equivalent background-upload implementation.
+
+### Supabase setup
+
+Create a public Storage bucket named `field-reports`, then create the reports table:
+
+```sql
+create table public.reports (
+  id text primary key,
+  description text not null,
+  image_urls text[] not null,
+  created_at timestamptz not null
+);
+
+alter table public.reports enable row level security;
+grant select, insert, update on public.reports to anon;
+
+create policy "field reports can be read by the test app"
+  on public.reports for select to anon using (true);
+create policy "field reports can be created by the test app"
+  on public.reports for insert to anon with check (true);
+create policy "field reports can be retried idempotently by the test app"
+  on public.reports for update to anon using (true) with check (true);
+
+create policy "field report photos can be uploaded by the test app"
+  on storage.objects for insert to anon
+  with check (bucket_id = 'field-reports');
+create policy "field report photos can be replaced on retry"
+  on storage.objects for update to anon
+  using (bucket_id = 'field-reports')
+  with check (bucket_id = 'field-reports');
+create policy "field report photos can be checked for idempotent upload"
+  on storage.objects for select to anon
+  using (bucket_id = 'field-reports');
+```
+
+The app uses an anon/publishable key and no login, as allowed by the brief. These open policies are for the technical test only; a production app must identify users and restrict rows, storage paths, and upload rates to those users. Never put a Supabase secret or service-role key in the app.
+
+### Upload and recovery behavior
+
+- A report must have a non-blank description and 1-5 photos.
+- Before a report is shown as saved, Android copies each photo into private app storage, corrects its orientation, resizes/compresses it, and checks the resulting file is no larger than 5,000,000 bytes.
+- The report queue is written atomically to app-private storage. Android WorkManager uploads it with a network requirement and a visible background-work notification. WorkManager persists scheduled work over normal process death and device reboot.
+- Photos use a stable path per report/photo and are uploaded with replace enabled. Each new report gets a UUID string in the table's unique `id` column; PostgREST upsert means retrying after a lost response does not create another report.
+- Network failures, timeouts, HTTP 408/425/429, and server 5xx responses are retried with exponential backoff. Other HTTP failures are surfaced for the user to review; the user can explicitly try again after fixing the cause.
+- The home screen separates the device queue from reports fetched from Supabase. Clearing local history deletes local reports and photo copies only; it does not delete server records or objects.
+
+Android prevents background work after the user explicitly force-stops an app. In that case the saved queue remains intact and resumes when the user opens the app again. A normal process kill or device reboot is different: WorkManager can restart eligible work when Android permits it.
+
+### Verification checklist
+
+1. Save a report in airplane mode, force-stop the app, reopen it, restore a connection, and verify it reaches Supabase without another tap.
+2. Queue multiple reports, including five large camera photos; confirm each stored image is at most 5 MB and remains viewable.
+3. Background the app during upload and reboot with queued work; verify Android resumes the queue when network is available.
+4. Interrupt the connection during upload, restore it, and confirm the same report ID and deterministic photo paths are reused.
+5. Remove an anon insert/upload policy to simulate a permanent authorization failure; the report should show an actionable failure rather than retrying endlessly. Restore the policy and use **Try again**.
+6. Try an empty description, zero photos, and a sixth photo; the composer must not save an invalid report.
+7. Deny camera/photo access, grant it later in Settings, and retry without restarting the app.
+
+To exercise transient server errors or a hanging endpoint on demand, use a controllable network proxy or a test backend in the Android emulator. A normal internet disconnect tests the connection-loss path, but does not simulate a server returning an HTTP error.
+
 # Getting Started
 
 > **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.

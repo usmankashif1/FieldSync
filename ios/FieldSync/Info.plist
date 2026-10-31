@@ -36,6 +36,10 @@
 	</dict>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string></string>
+	<key>NSCameraUsageDescription</key>
+	<string>FieldSync uses the camera when you choose to take a photo.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>FieldSync needs access to your photos so you can select an image to upload.</string>
 	<key>RCTNewArchEnabled</key>
 	<true/>
 	<key>UIApplicationSceneManifest</key>

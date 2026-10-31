@@ -1,146 +1,247 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
-import { supabase } from './supabase';
-import { uploadSingleImage } from './uploadService';
-import { ReportItem } from '../../screens/home/home.types';
+import { AppState, NativeModules, Platform } from 'react-native';
+import {
+    MAX_REPORT_DESCRIPTION_LENGTH,
+    MAX_REPORT_IMAGES,
+    type ReportItem,
+} from '../../screens/home/home.types';
+import { getSupabaseConfiguration } from './supabase';
 
-const QUEUE_STORAGE_KEY = '@field_reports_queue_v1';
-let isProcessing = false;
+const LEGACY_QUEUE_STORAGE_KEY = '@field_reports_queue_v1';
+const QUEUE_POLL_INTERVAL_MS = 2500;
 
-/**
- * Saves a new report to disk immediately before network execution.
- */
-export const saveReportToQueue = async (
-    description: string,
-    localImageUris: string[]
-): Promise<ReportItem> => {
-    const newReport: ReportItem = {
-        id: `report_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        description,
-        localImageUris,
-        uploadedImageUrls: [],
-        status: 'queued',
-        retryCount: 0,
-        createdAt: Date.now(),
-    };
+interface NativeReportQueue {
+    getReports(): Promise<ReportItem[]>;
+    recoverInterruptedUploads(): Promise<void>;
+    enqueueReport(description: string, imageUris: string[]): Promise<ReportItem>;
+    retryReport(reportId: string): Promise<void>;
+    clearQueue(): Promise<void>;
+    migrateLegacyQueue(legacyQueue: string): Promise<void>;
+    scheduleQueue(url: string, anonKey: string, delayMs: number): Promise<void>;
+}
 
-    const queue = await getLocalQueue();
-    queue.push(newReport);
-    await AsyncStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(queue));
+type QueueListener = (reports: ReportItem[]) => void;
 
-    // Trigger processor immediately
-    processQueue();
-    return newReport;
-};
-
-/**
- * Reads the current offline queue from disk.
- */
-export const getLocalQueue = async (): Promise<ReportItem[]> => {
-    try {
-        const raw = await AsyncStorage.getItem(QUEUE_STORAGE_KEY);
-        return raw ? JSON.parse(raw) : [];
-    } catch (error) {
-        console.error('Failed to read queue from disk:', error);
-        return [];
+export class QueueSchedulingError extends Error {
+    constructor(readonly report: ReportItem, cause: unknown) {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        super(`The report is saved on this device, but its upload could not be scheduled. ${detail}`);
+        this.name = 'QueueSchedulingError';
     }
-};
+}
 
-/**
- * Updates a specific report in the persistent disk storage.
- */
-const updateReportInQueue = async (updatedReport: ReportItem): Promise<void> => {
-    const queue = await getLocalQueue();
-    const index = queue.findIndex((r) => r.id === updatedReport.id);
-    if (index !== -1) {
-        queue[index] = updatedReport;
-        await AsyncStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(queue));
+const listeners = new Set<QueueListener>();
+let pollingTimer: ReturnType<typeof setInterval> | undefined;
+let isPolling = false;
+let schedulingPromise: Promise<void> | undefined;
+let migrationPromise: Promise<void> | undefined;
+
+const getNativeQueue = (): NativeReportQueue => {
+    if (Platform.OS !== 'android') {
+        throw new Error('Background report uploads are currently supported on Android only.');
     }
+
+    const nativeQueue = NativeModules.FieldReportQueue as NativeReportQueue | undefined;
+    if (!nativeQueue) {
+        throw new Error('The native report upload module is unavailable. Rebuild the Android app.');
+    }
+
+    return nativeQueue;
 };
 
-/**
- * Core Queue Processor: Processes queued items sequentially, 
- * uploading each report's photos simultaneously in parallel.
- */
-export const processQueue = async (): Promise<void> => {
-    if (isProcessing) return;
+const publishQueue = (reports: ReportItem[]): void => {
+    const snapshot = reports.map(report => ({
+        ...report,
+        images: report.images.map(image => ({ ...image })),
+    }));
+    listeners.forEach(listener => listener(snapshot));
+};
 
-    const netState = await NetInfo.fetch();
-    if (!netState.isConnected || !netState.isInternetReachable) {
-        console.log('Queue processor paused: No internet connection.');
+const refreshQueue = async (): Promise<void> => {
+    if (isPolling || AppState.currentState !== 'active' || listeners.size === 0) {
         return;
     }
 
-    isProcessing = true;
+    isPolling = true;
+    try {
+        publishQueue(await getNativeQueue().getReports());
+    } catch (error) {
+        console.error('Could not refresh the local report queue:', error);
+    } finally {
+        isPolling = false;
+    }
+};
+
+const ensureLegacyQueueMigrated = (): Promise<void> => {
+    if (migrationPromise) {
+        return migrationPromise;
+    }
+
+    migrationPromise = (async () => {
+        const legacyQueue = await AsyncStorage.getItem(LEGACY_QUEUE_STORAGE_KEY);
+        if (!legacyQueue) {
+            return;
+        }
+
+        await getNativeQueue().migrateLegacyQueue(legacyQueue);
+        await AsyncStorage.removeItem(LEGACY_QUEUE_STORAGE_KEY);
+    })().catch(error => {
+        migrationPromise = undefined;
+        throw error;
+    });
+
+    return migrationPromise;
+};
+
+const scheduleQueue = async (delayMs = 0): Promise<void> => {
+    const { url, anonKey } = getSupabaseConfiguration();
+    await getNativeQueue().scheduleQueue(url, anonKey, delayMs);
+};
+
+/**
+ * Migrates previously queued reports, then asks Android to resume durable work.
+ */
+export const initializeQueue = async (): Promise<void> => {
+    await ensureLegacyQueueMigrated();
+    await getNativeQueue().recoverInterruptedUploads();
+    await processQueue();
+};
+
+/**
+ * Reads the device-persisted queue. Server history is loaded separately.
+ */
+export const getLocalQueue = async (): Promise<ReportItem[]> => {
+    await ensureLegacyQueueMigrated();
+    return getNativeQueue().getReports();
+};
+
+/**
+ * Subscribes to native queue updates while the app is in the foreground.
+ */
+export const subscribeToQueue = (listener: QueueListener): (() => void) => {
+    listeners.add(listener);
+    refreshQueue();
+
+    if (!pollingTimer) {
+        pollingTimer = setInterval(() => {
+            refreshQueue();
+        }, QUEUE_POLL_INTERVAL_MS);
+    }
+
+    return () => {
+        listeners.delete(listener);
+        if (listeners.size === 0 && pollingTimer) {
+            clearInterval(pollingTimer);
+            pollingTimer = undefined;
+        }
+    };
+};
+
+/**
+ * Saves a durable report before scheduling its background upload.
+ */
+export const saveReportToQueue = async (
+    description: string,
+    imageUris: string[],
+): Promise<ReportItem> => {
+    const cleanDescription = description.trim();
+    if (!cleanDescription) {
+        throw new Error('Enter a description before saving the report.');
+    }
+    if (cleanDescription.length > MAX_REPORT_DESCRIPTION_LENGTH) {
+        throw new Error(`A report description can contain no more than ${MAX_REPORT_DESCRIPTION_LENGTH} characters.`);
+    }
+    if (imageUris.length === 0) {
+        throw new Error('Select at least one photo before saving the report.');
+    }
+    if (imageUris.length > MAX_REPORT_IMAGES) {
+        throw new Error(`A report can contain no more than ${MAX_REPORT_IMAGES} photos.`);
+    }
+
+    await ensureLegacyQueueMigrated();
+    const report = await getNativeQueue().enqueueReport(cleanDescription, imageUris);
+    refreshQueue();
 
     try {
-        const queue = await getLocalQueue();
-        const pendingReports = queue.filter(
-            (r) => r.status === 'queued' || r.status === 'failed'
-        );
+        await scheduleQueue();
+    } catch (error) {
+        throw new QueueSchedulingError(report, error);
+    }
 
-        for (const report of pendingReports) {
-            // 1. Mark report as uploading on disk
-            report.status = 'uploading';
-            report.lastAttemptAt = Date.now();
-            await updateReportInQueue(report);
+    return report;
+};
 
-            try {
-                // 2. Upload all photos simultaneously using Promise.all
-                const uploadPromises = report.localImageUris.map((uri) =>
-                    uploadSingleImage(uri)
-                );
+/**
+ * Explicitly retries a report after the user has reviewed its failure.
+ */
+export const retryReport = async (reportId: string): Promise<void> => {
+    await ensureLegacyQueueMigrated();
+    await getNativeQueue().retryReport(reportId);
+    const reports = await getNativeQueue().getReports();
+    publishQueue(reports);
+    const retriedReport = reports.find(report => report.id === reportId);
+    if (!retriedReport) {
+        throw new Error('The report was not found after its retry was saved.');
+    }
 
-                const results = await Promise.all(uploadPromises);
-
-                // Check if any single photo failed
-                const failedUploads = results.filter((url) => url === null);
-                if (failedUploads.length > 0) {
-                    throw new Error('One or more photo uploads failed during parallel transfer.');
-                }
-
-                const validUrls = results as string[];
-
-                // 3. Post metadata payload to Supabase Database table 'reports'
-                const { error: dbError } = await supabase.from('reports').insert([
-                    {
-                        id: report.id, // Enforces server-side idempotency
-                        description: report.description,
-                        image_urls: validUrls,
-                        created_at: new Date(report.createdAt).toISOString(),
-                    },
-                ]);
-
-                if (dbError) throw dbError;
-
-                // 4. Mark complete on disk
-                report.uploadedImageUrls = validUrls;
-                report.status = 'synced';
-                await updateReportInQueue(report);
-                console.log(`Report ${report.id} successfully synced to server!`);
-
-            } catch (err) {
-                console.error(`Failed to upload report ${report.id}:`, err);
-                report.status = 'failed';
-                report.retryCount += 1;
-                await updateReportInQueue(report);
-            }
-        }
-    } finally {
-        isProcessing = false;
+    try {
+        await scheduleQueue();
+    } catch (error) {
+        throw new QueueSchedulingError(retriedReport, error);
     }
 };
 
 /**
- * Listens for network changes and processes queue automatically when online.
+ * Clears local queue history and local photo copies; server data is unchanged.
  */
-export const initQueueNetworkListener = (): (() => void) => {
-    const unsubscribe = NetInfo.addEventListener((state) => {
-        if (state.isConnected && state.isInternetReachable) {
-            console.log('Network restored. Triggering background queue processing...');
-            processQueue();
+export const clearLocalQueue = async (): Promise<void> => {
+    await ensureLegacyQueueMigrated();
+    await getNativeQueue().clearQueue();
+    publishQueue([]);
+};
+
+/**
+ * Schedules durable Android work for any report that is not terminal.
+ */
+export const processQueue = (): Promise<void> => {
+    if (schedulingPromise) {
+        return schedulingPromise;
+    }
+
+    schedulingPromise = (async () => {
+        await ensureLegacyQueueMigrated();
+        const reports = await getNativeQueue().getReports();
+        const hasWork = reports.some(report =>
+            report.status === 'queued' ||
+            report.status === 'uploading' ||
+            report.status === 'retrying' ||
+            (report.status === 'failed' && report.retryable),
+        );
+
+        if (hasWork) {
+            await scheduleQueue();
         }
+    })().finally(() => {
+        schedulingPromise = undefined;
     });
 
-    return unsubscribe;
+    return schedulingPromise;
 };
+
+/**
+ * Schedules pending reports promptly when connectivity returns.
+ */
+export const initQueueNetworkListener = (): (() => void) =>
+    (() => {
+        let wasOnline = false;
+        return NetInfo.addEventListener(state => {
+            // Carrier networks can fail NetInfo's reachability probe while still passing traffic.
+            // WorkManager's CONNECTED constraint is the authoritative upload gate.
+            const isOnline = state.isConnected === true;
+            if (isOnline && !wasOnline) {
+                processQueue().catch(error => console.error('Could not resume the report queue:', error));
+            }
+            wasOnline = isOnline;
+        });
+    })();

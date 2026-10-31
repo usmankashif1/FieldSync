@@ -1,164 +1,168 @@
-import React, { useState } from 'react';
-import { Alert, FlatList, Image, RefreshControl, StyleSheet, Text, View } from 'react-native';
-import type { Asset } from 'react-native-image-picker';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+    ActivityIndicator,
+    Alert,
+    FlatList,
+    RefreshControl,
+    StyleSheet,
+    View,
+} from 'react-native';
 import AppButton from '../../../components/AppButton';
 import AppHeader from '../../../components/AppHeader';
 import AppText from '../../../components/AppText';
-import Screen from '../../../components/Screen';
-import SkeletonLoader from '../../../components/SkeletonLoader';
-import { openPermissionSettings, requestGalleryPermission } from '../../../core/permissions/permissionService';
+import { clearLocalQueue, getLocalQueue, subscribeToQueue } from '../../../core/services/queueEngine';
 import { defaultTheme } from '../../../core/theme/defaultTheme';
 import { getErrorMessage } from '../../../core/utils/errorMessage';
-import { showErrorToast, showInfoToast, showSuccessToast } from '../../../core/utils/toast';
+import { showErrorToast, showSuccessToast } from '../../../core/utils/toast';
 import HomeListItem from '../components/HomeListItem';
-import HomeListItemSkeleton from '../components/HomeListItemSkeleton';
+import ReportComposer from '../components/ReportComposer';
+import ReportQueueCard from '../components/ReportQueueCard';
 import { useHomeItems } from '../hooks/useHomeItems';
+import type { ReportItem } from '../home.types';
 
-const Separator = () => <View style={styles.separator} />;
+const ServerItemSeparator = () => <View style={styles.separator} />;
 
 const HomeScreen = () => {
     const { items, loading, error, reload } = useHomeItems();
-    const [selectingImage, setSelectingImage] = useState(false);
-    const [selectedImage, setSelectedImage] = useState<Asset | null>(null);
-    const [image_url, setImage_url] = useState<string | null>(null);
+    const [queue, setQueue] = useState<ReportItem[]>([]);
+    const refreshedReports = useRef(new Set<string>());
 
-    const handleUploadImage = async (): Promise<void> => {
-        setSelectingImage(true);
-
-        try {
-            const permissionResult = await requestGalleryPermission();
-
-            if (permissionResult === 'blocked') {
-                Alert.alert(
-                    'Photo access blocked',
-                    'Enable photo access in Settings, then tap Upload image again.',
-                    [
-                        { text: 'Not now', style: 'cancel' },
-                        {
-                            text: 'Open Settings',
-                            onPress: async () => {
-                                try {
-                                    await openPermissionSettings();
-                                } catch (permissionError) {
-                                    showErrorToast('Could not open Settings', getErrorMessage(permissionError));
-                                }
-                            },
-                        },
-                    ],
-                );
-                return;
+    useEffect(() => {
+        let mounted = true;
+        const unsubscribe = subscribeToQueue(reports => {
+            if (mounted) {
+                setQueue(reports);
             }
+        });
 
-            if (permissionResult === 'denied') {
-                showInfoToast('Photo access needed', 'Tap Upload image to try requesting permission again.');
-                return;
-            }
-
-            if (permissionResult === 'unavailable') {
-                showErrorToast('Photo access unavailable', 'This device does not support photo-library access.');
-                return;
-            }
-
-            const { launchImageLibrary } = require('react-native-image-picker') as typeof import('react-native-image-picker');
-            const pickerResponse = await launchImageLibrary({
-                mediaType: 'photo',
-                selectionLimit: 1,
-                quality: 0.9,
+        getLocalQueue()
+            .then(reports => {
+                if (mounted) {
+                    setQueue(reports);
+                }
+            })
+            .catch(queueError => {
+                showErrorToast('Could not load saved reports', getErrorMessage(queueError));
             });
 
-            if (pickerResponse.didCancel) {
-                return;
+        return () => {
+            mounted = false;
+            unsubscribe();
+        };
+    }, []);
+
+    useEffect(() => {
+        const newlySyncedReports = queue.filter(
+            report => report.status === 'synced' && !refreshedReports.current.has(report.id),
+        );
+        queue.forEach(report => {
+            if (report.status === 'synced') {
+                refreshedReports.current.add(report.id);
             }
+        });
 
-            if (pickerResponse.errorCode) {
-                showErrorToast(
-                    'Could not select an image',
-                    pickerResponse.errorMessage ?? 'Please try selecting the image again.',
-                );
-                return;
-            }
-
-            const image = pickerResponse.assets?.[0];
-            if (!image?.uri) {
-                showErrorToast('Could not select an image', 'The selected image could not be opened.');
-                return;
-            }
-
-            setSelectedImage(image);
-            const { uploadSingleImage } = require('../../../core/services/uploadService') as typeof import('../../../core/services/uploadService');
-            try {
-                const image_url = await uploadSingleImage(image.uri, {
-                    fileName: image.fileName,
-                    mimeType: image.type,
-                });
-                setImage_url(image_url);
-                console.log("uploaded image url:", image_url)
-
-            } catch (uploadError) {
-                showErrorToast('Image upload failed', getErrorMessage(uploadError));
-                return;
-            }
-
-            showSuccessToast('Image uploaded', image.fileName ?? 'Your image is ready');
-        } catch (permissionError) {
-            showErrorToast('Could not select an image', getErrorMessage(permissionError));
-        } finally {
-            setSelectingImage(false);
+        if (newlySyncedReports.length > 0) {
+            reload();
         }
+    }, [queue, reload]);
+
+    const confirmClearHistory = (): void => {
+        if (queue.length === 0) {
+            showSuccessToast('Nothing to clear', 'There are no locally saved reports.');
+            return;
+        }
+
+        Alert.alert(
+            'Clear local report history?',
+            'This deletes reports saved on this device and their local photo copies. Any report that has not uploaded yet will be discarded. Reports already on the server are not deleted.',
+            [
+                { text: 'Keep reports', style: 'cancel' },
+                {
+                    text: 'Clear local history',
+                    style: 'destructive',
+                    onPress: () => {
+                        clearLocalQueue()
+                            .then(() => showSuccessToast('Local history cleared'))
+                            .catch(clearError => showErrorToast('Could not clear local history', getErrorMessage(clearError)));
+                    },
+                },
+            ],
+        );
     };
 
-
+    const header = (
+        <View>
+            <AppHeader title="Field reports" />
+            <ReportComposer />
+            <View style={styles.sectionHeading}>
+                <View style={styles.sectionTitle}>
+                    <AppText variant="h2">On this device</AppText>
+                    <AppText variant="caption" color={defaultTheme.colors.textSecondary}>
+                        Saved reports are safe offline. Upload status is shown separately from server history.
+                    </AppText>
+                </View>
+                <AppButton
+                    title="Clear"
+                    variant="text"
+                    onPress={confirmClearHistory}
+                    disabled={queue.length === 0}
+                />
+            </View>
+            {queue.length === 0 ? (
+                <AppText style={styles.emptyQueue} color={defaultTheme.colors.textSecondary}>
+                    No reports saved on this device.
+                </AppText>
+            ) : (
+                [...queue]
+                    .sort((newer, older) => older.createdAt - newer.createdAt)
+                    .map(report => <ReportQueueCard key={report.id} report={report} />)
+            )}
+            <View style={styles.serverHeading}>
+                <AppText variant="h2">Received by server</AppText>
+                <AppText variant="caption" color={defaultTheme.colors.textSecondary}>
+                    This list is fetched from Supabase; it is not the local upload queue.
+                </AppText>
+            </View>
+        </View>
+    );
 
     return (
-        <Screen>
-            <AppHeader title="Home" />
-            <View style={styles.body}>
-                <AppButton
-                    title="Upload image"
-                    onPress={handleUploadImage}
-                    loading={selectingImage}
-                    disabled={selectingImage}
-                />
-                <Text style={{ marginTop: 10, marginBottom: 10, color: defaultTheme.colors.textSecondary }}>
-                    {image_url}
-                </Text>
-                {image_url ? (
-                    <View style={styles.selectedImageContainer}>
-                        <Image source={{ uri: image_url }} style={styles.selectedImage} resizeMode="cover" />
-                    </View>
-                ) : null}
-                <SkeletonLoader loading={loading} count={6} renderSkeleton={index => <HomeListItemSkeleton key={index} />}>
-                    <FlatList
-                        data={items}
-                        keyExtractor={item => item.id}
-                        renderItem={({ item }) => <HomeListItem item={item} />}
-                        ItemSeparatorComponent={Separator}
-                        refreshControl={<RefreshControl refreshing={false} onRefresh={reload} />}
-                        ListEmptyComponent={
-                            <AppText align="center" color={defaultTheme.colors.textSecondary}>
-                                {error ?? 'Nothing here yet'}
-                            </AppText>
-                        }
-                    />
-                </SkeletonLoader>
-            </View>
-
-
-
-        </Screen>
+        <FlatList
+            style={styles.list}
+            contentContainerStyle={styles.content}
+            data={items}
+            keyExtractor={item => item.id}
+            renderItem={({ item }) => <HomeListItem item={item} />}
+            ItemSeparatorComponent={ServerItemSeparator}
+            ListHeaderComponent={header}
+            ListEmptyComponent={
+                loading ? (
+                    <ActivityIndicator style={styles.emptyServer} color={defaultTheme.colors.primary} />
+                ) : (
+                    <AppText style={styles.emptyServer} align="center" color={error ? defaultTheme.colors.error : defaultTheme.colors.textSecondary}>
+                        {error ?? 'No reports have reached the server yet.'}
+                    </AppText>
+                )
+            }
+            refreshControl={<RefreshControl refreshing={loading} onRefresh={reload} />}
+        />
     );
 };
 
 const styles = StyleSheet.create({
-    body: { flex: 1, paddingHorizontal: defaultTheme.spacing.md },
-    separator: { height: defaultTheme.spacing.sm },
-    selectedImageContainer: { gap: defaultTheme.spacing.sm },
-    selectedImage: {
-        width: '100%',
-        height: 220,
-        borderRadius: defaultTheme.radius.md,
-        backgroundColor: defaultTheme.colors.surface,
+    list: { flex: 1, backgroundColor: defaultTheme.colors.background },
+    content: { flexGrow: 1, paddingHorizontal: defaultTheme.spacing.md, paddingBottom: defaultTheme.spacing.xl },
+    sectionHeading: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: defaultTheme.spacing.sm,
+        marginBottom: defaultTheme.spacing.md,
     },
+    sectionTitle: { flex: 1, gap: defaultTheme.spacing.xs },
+    emptyQueue: { paddingVertical: defaultTheme.spacing.md },
+    serverHeading: { gap: defaultTheme.spacing.xs, marginTop: defaultTheme.spacing.lg, marginBottom: defaultTheme.spacing.md },
+    separator: { height: defaultTheme.spacing.sm },
+    emptyServer: { paddingVertical: defaultTheme.spacing.xl },
 });
 
 export default HomeScreen;

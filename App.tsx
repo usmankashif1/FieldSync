@@ -1,26 +1,34 @@
 import React, { useEffect } from 'react';
-import { StatusBar } from 'react-native';
+import { AppState, StatusBar } from 'react-native';
 import { Provider } from 'react-redux';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import Toast from 'react-native-toast-message';
 import { store } from './src/store/store';
 import RootNavigator from './src/navigation/root/RootNavigator';
-import { initQueueNetworkListener, processQueue } from './src/core/services/queueEngine';
+import { initQueueNetworkListener, initializeQueue, processQueue } from './src/core/services/queueEngine';
+import { getErrorMessage } from './src/core/utils/errorMessage';
+import { showErrorToast } from './src/core/utils/toast';
 
 const App = () => {
-
     useEffect(() => {
-        // 1. Listen for network reconnection
         const unsubscribeNet = initQueueNetworkListener();
+        const appStateSubscription = AppState.addEventListener('change', state => {
+            if (state === 'active') {
+                processQueue().catch(error => {
+                    showErrorToast('Could not resume saved reports', getErrorMessage(error));
+                });
+            }
+        });
 
-        // 2. Hydrate & process disk queue on app start (handles recovering from force-quit)
-        processQueue();
+        initializeQueue().catch(error => {
+            showErrorToast('Could not restore saved reports', getErrorMessage(error));
+        });
 
         return () => {
             unsubscribeNet();
+            appStateSubscription.remove();
         };
     }, []);
-
 
     return (
         <Provider store={store}>

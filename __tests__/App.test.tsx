@@ -19,6 +19,9 @@ jest.mock('../src/core/services/queueEngine', () => ({
 jest.mock('../src/screens/home/home.api', () => ({
   fetchHomeItems: jest.fn(() => Promise.resolve([])),
 }));
+jest.mock('@react-native-community/netinfo', () => ({
+  useNetInfo: jest.fn(() => ({ isConnected: true, isInternetReachable: true })),
+}));
 
 import App from '../App';
 

@@ -5,20 +5,13 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.ServiceInfo
 import android.os.Build
-import android.util.Log
 import androidx.core.app.NotificationCompat
-import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.Data
-import androidx.work.ExistingWorkPolicy
 import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkManager
 import androidx.work.Worker
 import androidx.work.WorkerParameters
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -26,221 +19,107 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
 import java.net.HttpURLConnection
-import java.net.SocketTimeoutException
 import java.net.URL
 import java.nio.charset.StandardCharsets
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.TimeZone
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 internal class ReportUploadWorker(
   context: Context,
   workerParams: WorkerParameters,
 ) : Worker(context, workerParams) {
-  override fun doWork(): Result {
-    val reports = try {
-      ReportQueueStore.getReports(applicationContext)
-    } catch (error: Exception) {
-      Log.e(TAG, "Could not read the local report queue.", error)
-      return Result.failure()
-    }
+  @Volatile
+  private var activeConnection: HttpURLConnection? = null
 
-    val hasPendingReports = (0 until reports.length()).any { index ->
-      val report = reports.optJSONObject(index) ?: return@any false
-      report.optString("status") != "synced" &&
-        !(report.optString("status") == "failed" && !report.optBoolean("retryable", true))
-    }
-    if (!hasPendingReports) {
-      return Result.success()
-    }
-
-    val backendUrl = inputData.getString(KEY_BACKEND_URL)
-    val anonKey = inputData.getString(KEY_ANON_KEY)
-    if (backendUrl.isNullOrBlank() || anonKey.isNullOrBlank()) {
-      markConfigurationFailure(reports, "Upload configuration is missing. Check the Supabase settings.")
-      return Result.failure()
-    }
-
+  override fun doWork(): Result =
     try {
       setForegroundAsync(createForegroundInfo()).get()
-      processReports(reports, backendUrl.trimEnd('/'), anonKey)
-      return Result.success()
-    } catch (error: UploadFailure) {
-      if (error.retryable) {
-        return Result.retry()
-      }
-      Log.e(TAG, "Report upload worker stopped on a permanent failure.", error)
-      return Result.failure()
+      transferFile()
     } catch (error: Exception) {
-      Log.e(TAG, "Unexpected report upload worker failure.", error)
-      markInterruptedReportsAsRetrying()
-      return Result.retry()
+      Result.failure(
+        transferResult(
+          successful = false,
+          statusCode = 0,
+          message = error.message ?: "The photo transfer failed.",
+        ),
+      )
     }
+
+  override fun onStopped() {
+    activeConnection?.disconnect()
+    super.onStopped()
   }
 
-  private fun processReports(reports: JSONArray, backendUrl: String, anonKey: String) {
-    for (index in 0 until reports.length()) {
-      if (isStopped) {
-        throw UploadFailure("Upload work was stopped.", true)
-      }
+  private fun transferFile(): Result {
+    val filePath = inputData.getString(KEY_FILE_PATH)
+      ?: return failure(0, "The local photo path is missing.")
+    val uploadUrl = inputData.getString(KEY_UPLOAD_URL)
+      ?: return failure(0, "The upload URL is missing.")
+    val reportId = inputData.getString(KEY_REPORT_ID)
+      ?: return failure(0, "The report identifier is missing.")
+    val anonKey = inputData.getString(KEY_ANON_KEY)
+      ?: return failure(0, "The publishable key is missing.")
+    val contentType = inputData.getString(KEY_CONTENT_TYPE) ?: "image/jpeg"
+    if (!uploadUrl.startsWith("https://")) {
+      return failure(0, "The upload URL must use HTTPS.")
+    }
+    if (!contentType.startsWith("image/")) {
+      return failure(0, "The photo content type is invalid.")
+    }
 
-      val report = reports.optJSONObject(index) ?: continue
-      val status = report.optString("status")
-      if (status == "synced" || (status == "failed" && !report.optBoolean("retryable", true))) {
-        continue
-      }
+    val file = File(filePath)
+    if (!file.isFile || !file.canRead() || file.length() == 0L) {
+      return failure(0, "The saved photo is no longer available.")
+    }
 
-      report.put("status", "uploading")
-        .put("retryable", true)
-        .put("lastAttemptAt", System.currentTimeMillis())
-        .put("error", JSONObject.NULL)
-      ReportQueueStore.updateReport(applicationContext, report)
-
-      try {
-        uploadReport(report, backendUrl, anonKey)
-        report.put("status", "synced")
-          .put("retryable", false)
-          .put("error", JSONObject.NULL)
-        ReportQueueStore.updateReport(applicationContext, report)
-      } catch (error: UploadFailure) {
-        recordReportFailure(report, error)
-        if (error.retryable) {
-          throw error
+    val connection = URL(uploadUrl).openConnection() as HttpURLConnection
+    activeConnection = connection
+    if (isStopped) {
+      connection.disconnect()
+      return failure(0, "The photo transfer was interrupted.")
+    }
+    val lastWriteAt = AtomicLong(System.currentTimeMillis())
+    val writeWatchdog = watchdogExecutor.scheduleAtFixedRate(
+      {
+        if (System.currentTimeMillis() - lastWriteAt.get() > NETWORK_IDLE_TIMEOUT_MS) {
+          connection.disconnect()
         }
-      } catch (error: SocketTimeoutException) {
-        val uploadFailure = UploadFailure(error.message ?: "The server took too long to respond.", true)
-        recordReportFailure(report, uploadFailure)
-        throw uploadFailure
-      } catch (error: IOException) {
-        val uploadFailure = UploadFailure(error.message ?: "The network connection was interrupted.", true)
-        recordReportFailure(report, uploadFailure)
-        throw uploadFailure
-      } catch (error: Exception) {
-        val uploadFailure = UploadFailure(
-          error.message ?: "The report could not be uploaded. Check its details and try again.",
-          false,
-        )
-        recordReportFailure(report, uploadFailure)
-      }
-    }
-  }
-
-  private fun uploadReport(report: JSONObject, backendUrl: String, anonKey: String) {
-    val reportId = report.getString("id")
-    val images = report.optJSONArray("images")
-      ?: throw UploadFailure("The report has no saved photos.", false)
-    if (images.length() !in 1..MAX_IMAGES) {
-      throw UploadFailure("A report must contain between 1 and $MAX_IMAGES photos.", false)
-    }
-
-    val imageUrls = JSONArray()
-    for (index in 0 until images.length()) {
-      val image = images.getJSONObject(index)
-      if (image.optString("status") == "completed" && image.optString("url").isNotBlank()) {
-        imageUrls.put(image.getString("url"))
-        continue
-      }
-
-      val imageFile = localFile(image.optString("uri"))
-      if (!imageFile.isFile || !imageFile.canRead() || imageFile.length() == 0L) {
-        val failure = UploadFailure("Saved photo ${index + 1} is no longer available on this device.", false)
-        image.put("status", "failed").put("error", failure.message)
-        ReportQueueStore.updateReport(applicationContext, report)
-        throw failure
-      }
-      if (imageFile.length() > ReportMediaStore.MAX_IMAGE_BYTES) {
-        val failure = UploadFailure("Photo ${index + 1} exceeds the 5 MB upload limit.", false)
-        image.put("status", "failed").put("error", failure.message)
-        ReportQueueStore.updateReport(applicationContext, report)
-        throw failure
-      }
-
-      image.put("status", "uploading")
-        .put("progress", 0)
-        .put("error", JSONObject.NULL)
-      ReportQueueStore.updateReport(applicationContext, report)
-
-      val objectPath = "reports/$reportId/$index.jpg"
-      try {
-        uploadImage(backendUrl, anonKey, objectPath, imageFile, report, image)
-      } catch (error: Exception) {
-        val failure = classifyUploadError(error)
-        image.put("status", "failed").put("error", failure.message)
-        ReportQueueStore.updateReport(applicationContext, report)
-        throw failure
-      }
-
-      val publicUrl = "$backendUrl/storage/v1/object/public/field-reports/$objectPath"
-      image.put("status", "completed")
-        .put("url", publicUrl)
-        .put("progress", 100)
-        .put("error", JSONObject.NULL)
-      ReportQueueStore.updateReport(applicationContext, report)
-      imageUrls.put(publicUrl)
-    }
-
-    val createdAt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
-      .apply { timeZone = TimeZone.getTimeZone("UTC") }
-      .format(Date(report.optLong("createdAt", System.currentTimeMillis())))
-    val reportBody = JSONObject()
-      .put("id", reportId)
-      .put("description", report.getString("description"))
-      .put("image_urls", imageUrls)
-      .put("created_at", createdAt)
-
-    val response = executeRequest(
-      "$backendUrl/rest/v1/reports?on_conflict=id",
-      "POST",
-      mapOf(
-        "apikey" to anonKey,
-        "Authorization" to "Bearer $anonKey",
-        "Content-Type" to "application/json",
-        "Prefer" to "resolution=merge-duplicates,return=minimal",
-      ),
-      "[$reportBody]".toByteArray(StandardCharsets.UTF_8),
+      },
+      WATCHDOG_CHECK_INTERVAL_MS.toLong(),
+      WATCHDOG_CHECK_INTERVAL_MS.toLong(),
+      TimeUnit.MILLISECONDS,
     )
-    requireSuccess(response)
-  }
-
-  private fun uploadImage(
-    backendUrl: String,
-    anonKey: String,
-    objectPath: String,
-    imageFile: File,
-    report: JSONObject,
-    image: JSONObject,
-  ) {
-    val encodedPath = objectPath.split('/').joinToString("/") {
-      java.net.URLEncoder.encode(it, StandardCharsets.UTF_8.name()).replace("+", "%20")
-    }
-    val connection = (URL("$backendUrl/storage/v1/object/field-reports/$encodedPath").openConnection() as HttpURLConnection)
-    try {
+    return try {
+      setProgressAsync(Data.Builder().putInt(KEY_PROGRESS, 0).build()).get()
       connection.requestMethod = "POST"
       connection.connectTimeout = CONNECT_TIMEOUT_MS
       connection.readTimeout = READ_TIMEOUT_MS
       connection.doOutput = true
-      connection.setFixedLengthStreamingMode(imageFile.length())
+      connection.setFixedLengthStreamingMode(file.length())
       connection.setRequestProperty("apikey", anonKey)
       connection.setRequestProperty("Authorization", "Bearer $anonKey")
-      connection.setRequestProperty("Content-Type", "image/jpeg")
+      connection.setRequestProperty("Content-Type", contentType)
       connection.setRequestProperty("x-upsert", "true")
-      BufferedInputStream(FileInputStream(imageFile)).use { input ->
+      connection.setRequestProperty("x-report-id", reportId)
+
+      BufferedInputStream(FileInputStream(file)).use { input ->
         BufferedOutputStream(connection.outputStream).use { output ->
-          val buffer = ByteArray(16 * 1024)
-          var totalWritten = 0L
-          var nextProgressThreshold = 10
+          val buffer = ByteArray(BUFFER_SIZE)
+          var bytesWritten = 0L
+          var nextProgress = 10
           var bytesRead = input.read(buffer)
           while (bytesRead >= 0) {
+            if (isStopped) {
+              throw IOException("The photo transfer was interrupted.")
+            }
             if (bytesRead > 0) {
               output.write(buffer, 0, bytesRead)
-              totalWritten += bytesRead
-              val progress = ((totalWritten * 100) / imageFile.length()).toInt().coerceAtMost(99)
-              if (progress >= nextProgressThreshold) {
-                image.put("progress", progress)
-                ReportQueueStore.updateReport(applicationContext, report)
-                nextProgressThreshold = (progress / 10 + 1) * 10
+              lastWriteAt.set(System.currentTimeMillis())
+              bytesWritten += bytesRead
+              val progress = ((bytesWritten * 100) / file.length()).toInt().coerceAtMost(99)
+              if (progress >= nextProgress) {
+                setProgressAsync(Data.Builder().putInt(KEY_PROGRESS, progress).build()).get()
+                nextProgress = (progress / 10 + 1) * 10
               }
             }
             bytesRead = input.read(buffer)
@@ -248,128 +127,26 @@ internal class ReportUploadWorker(
           output.flush()
         }
       }
-      requireSuccess(readResponse(connection))
-    } finally {
-      connection.disconnect()
-    }
-  }
 
-  private fun executeRequest(
-    requestUrl: String,
-    method: String,
-    headers: Map<String, String>,
-    body: ByteArray,
-  ): HttpResponse {
-    val connection = URL(requestUrl).openConnection() as HttpURLConnection
-    try {
-      connection.requestMethod = method
-      connection.connectTimeout = CONNECT_TIMEOUT_MS
-      connection.readTimeout = READ_TIMEOUT_MS
-      connection.doOutput = true
-      headers.forEach { (name, value) -> connection.setRequestProperty(name, value) }
-      connection.setFixedLengthStreamingMode(body.size)
-      connection.outputStream.use { output -> output.write(body) }
-      return readResponse(connection)
-    } finally {
-      connection.disconnect()
-    }
-  }
-
-  private fun readResponse(connection: HttpURLConnection): HttpResponse {
-    val statusCode = connection.responseCode
-    val responseStream = if (statusCode in 200..299) connection.inputStream else connection.errorStream
-    val responseBody = responseStream?.use { stream ->
-      val buffer = ByteArray(1024)
-      val output = ByteArrayOutputStream()
-      while (output.size() < MAX_RESPONSE_BYTES) {
-        val remaining = MAX_RESPONSE_BYTES - output.size()
-        val bytesRead = stream.read(buffer, 0, minOf(buffer.size, remaining))
-        if (bytesRead < 0) {
-          break
-        }
-        output.write(buffer, 0, bytesRead)
-      }
-      output.toString(StandardCharsets.UTF_8.name())
-    }.orEmpty()
-    return HttpResponse(statusCode, responseBody)
-  }
-
-  private fun requireSuccess(response: HttpResponse) {
-    if (response.statusCode in 200..299) {
-      return
-    }
-    val retryable = response.statusCode == 408 ||
-      response.statusCode == 425 ||
-      response.statusCode == 429 ||
-      response.statusCode >= 500
-    val detail = response.body.trim().takeIf { it.isNotEmpty() }
-    val message = detail?.let { "Server returned HTTP ${response.statusCode}: $it" }
-      ?: "Server returned HTTP ${response.statusCode}."
-    throw UploadFailure(message, retryable)
-  }
-
-  private fun classifyUploadError(error: Exception): UploadFailure = when (error) {
-    is UploadFailure -> error
-    is SocketTimeoutException -> UploadFailure(error.message ?: "The server took too long to respond.", true)
-    is IOException -> UploadFailure(error.message ?: "The network connection was interrupted.", true)
-    else -> UploadFailure(error.message ?: "The photo could not be uploaded.", false)
-  }
-
-  private fun recordReportFailure(report: JSONObject, failure: UploadFailure) {
-    report.put("status", if (failure.retryable) "retrying" else "failed")
-      .put("retryable", failure.retryable)
-      .put("retryCount", report.optInt("retryCount", 0) + 1)
-      .put("error", failure.message)
-    ReportQueueStore.updateReport(applicationContext, report)
-    Log.w(TAG, "Report ${report.optString("id")} upload failed: ${failure.message}")
-  }
-
-  private fun markConfigurationFailure(reports: JSONArray, message: String) {
-    for (index in 0 until reports.length()) {
-      val report = reports.optJSONObject(index) ?: continue
-      if (report.optString("status") == "synced") {
-        continue
-      }
-      report.put("status", "failed")
-        .put("retryable", false)
-        .put("error", message)
-      report.optJSONArray("images")?.let { images ->
-        for (imageIndex in 0 until images.length()) {
-          val image = images.getJSONObject(imageIndex)
-          if (image.optString("status") == "uploading") {
-            image.put("status", "pending")
-              .put("progress", 0)
-          }
-        }
-      }
-      ReportQueueStore.updateReport(applicationContext, report)
-    }
-  }
-
-  private fun markInterruptedReportsAsRetrying() {
-    try {
-      val reports = ReportQueueStore.getReports(applicationContext)
-      for (index in 0 until reports.length()) {
-        val report = reports.getJSONObject(index)
-        if (report.optString("status") != "uploading") {
-          continue
-        }
-        report.put("status", "retrying")
-          .put("retryable", true)
-          .put("retryCount", report.optInt("retryCount", 0) + 1)
-        report.optJSONArray("images")?.let { images ->
-          for (imageIndex in 0 until images.length()) {
-            val image = images.getJSONObject(imageIndex)
-            if (image.optString("status") == "uploading") {
-              image.put("status", "pending")
-                .put("progress", 0)
-            }
-          }
-        }
-        ReportQueueStore.updateReport(applicationContext, report)
-      }
+      val response = readResponse(connection)
+      val success = response.statusCode in 200..299
+      Result.success(
+        transferResult(
+          successful = success,
+          statusCode = response.statusCode,
+          message = if (success) "" else response.body.ifBlank {
+            "Server returned HTTP ${response.statusCode}."
+          },
+        ),
+      )
     } catch (error: Exception) {
-      Log.e(TAG, "Could not persist interrupted report status.", error)
+      failure(0, error.message ?: "The photo transfer failed.")
+    } finally {
+      writeWatchdog.cancel(false)
+      connection.disconnect()
+      if (activeConnection === connection) {
+        activeConnection = null
+      }
     }
   }
 
@@ -384,11 +161,10 @@ internal class ReportUploadWorker(
         ),
       )
     }
-
     val notification = NotificationCompat.Builder(applicationContext, NOTIFICATION_CHANNEL_ID)
       .setSmallIcon(android.R.drawable.stat_sys_upload)
       .setContentTitle("Uploading field reports")
-      .setContentText("Saved reports are syncing in the background.")
+      .setContentText("A saved photo is being transferred.")
       .setOngoing(true)
       .setOnlyAlertOnce(true)
       .build()
@@ -404,51 +180,61 @@ internal class ReportUploadWorker(
     }
   }
 
-  private fun localFile(uri: String): File {
-    val path = android.net.Uri.parse(uri).path
-      ?: throw UploadFailure("A saved photo path is invalid.", false)
-    return File(path)
+  private fun readResponse(connection: HttpURLConnection): HttpResponse {
+    val statusCode = connection.responseCode
+    val responseStream = if (statusCode in 200..299) connection.inputStream else connection.errorStream
+    val body = responseStream?.use { stream ->
+      val output = ByteArrayOutputStream()
+      val buffer = ByteArray(BUFFER_SIZE)
+      while (output.size() < MAX_RESPONSE_BYTES) {
+        val remaining = MAX_RESPONSE_BYTES - output.size()
+        val bytesRead = stream.read(buffer, 0, minOf(buffer.size, remaining))
+        if (bytesRead < 0) break
+        output.write(buffer, 0, bytesRead)
+      }
+      output.toString(StandardCharsets.UTF_8.name())
+    }.orEmpty()
+    return HttpResponse(statusCode, body)
   }
+
+  private fun failure(statusCode: Int, message: String): Result =
+    Result.failure(transferResult(successful = false, statusCode = statusCode, message = message))
+
+  private fun transferResult(successful: Boolean, statusCode: Int, message: String): Data =
+    Data.Builder()
+      .putBoolean(KEY_SUCCESSFUL, successful)
+      .putInt(KEY_STATUS_CODE, statusCode)
+      .putString(KEY_MESSAGE, message)
+      .build()
 
   private data class HttpResponse(val statusCode: Int, val body: String)
 
-  private class UploadFailure(
-    override val message: String,
-    val retryable: Boolean,
-  ) : Exception(message)
-
   companion object {
-    const val UNIQUE_WORK_NAME = "field-report-upload-queue"
-    private const val TAG = "FieldReportUpload"
-    private const val KEY_BACKEND_URL = "supabase_url"
-    private const val KEY_ANON_KEY = "supabase_anon_key"
-    private const val MAX_IMAGES = 5
+    const val KEY_REPORT_ID = "report_id"
+    const val KEY_FILE_PATH = "file_path"
+    const val KEY_UPLOAD_URL = "upload_url"
+    const val KEY_ANON_KEY = "anon_key"
+    const val KEY_CONTENT_TYPE = "content_type"
+    const val KEY_PROGRESS = "progress"
+    const val KEY_SUCCESSFUL = "successful"
+    const val KEY_STATUS_CODE = "status_code"
+    const val KEY_MESSAGE = "message"
     private const val CONNECT_TIMEOUT_MS = 30_000
     private const val READ_TIMEOUT_MS = 120_000
+    private const val NETWORK_IDLE_TIMEOUT_MS = 150_000
+    private const val WATCHDOG_CHECK_INTERVAL_MS = 15_000
+    private const val BUFFER_SIZE = 16 * 1024
     private const val MAX_RESPONSE_BYTES = 4096
     private const val NOTIFICATION_CHANNEL_ID = "field-report-uploads"
     private const val NOTIFICATION_ID = 4401
+    private val watchdogExecutor = java.util.concurrent.Executors
+      .newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "field-report-upload-watchdog").apply { isDaemon = true }
+      }
 
-    fun enqueue(context: Context, url: String, anonKey: String, delayMs: Long) {
-      val constraints = Constraints.Builder()
+    fun networkConstraints(): Constraints =
+      Constraints.Builder()
         .setRequiredNetworkType(NetworkType.CONNECTED)
         .build()
-      val input = Data.Builder()
-        .putString(KEY_BACKEND_URL, url)
-        .putString(KEY_ANON_KEY, anonKey)
-        .build()
-      val request = OneTimeWorkRequestBuilder<ReportUploadWorker>()
-        .setConstraints(constraints)
-        .setInputData(input)
-        .setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
-        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-        .build()
-
-      WorkManager.getInstance(context).enqueueUniqueWork(
-        UNIQUE_WORK_NAME,
-        ExistingWorkPolicy.APPEND_OR_REPLACE,
-        request,
-      ).result.get()
-    }
   }
 }

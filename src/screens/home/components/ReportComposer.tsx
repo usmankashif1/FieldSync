@@ -1,55 +1,34 @@
 import React, { useState } from 'react';
-import {
-    Alert,
-    Image,
-    Pressable,
-    StyleSheet,
-    TextInput,
-    View,
-} from 'react-native';
+import { Alert, Image, Pressable, StyleSheet, TextInput, View } from 'react-native';
 import type { Asset, ImagePickerResponse } from 'react-native-image-picker';
 import AppButton from '../../../components/AppButton';
 import AppText from '../../../components/AppText';
-import {
-    openPermissionSettings,
-    requestCameraPermission,
-    requestGalleryPermission,
-} from '../../../core/permissions/permissionService';
+import { openPermissionSettings, requestCameraPermission, requestGalleryPermission } from '../../../core/permissions/permissionService';
 import { defaultTheme } from '../../../core/theme/defaultTheme';
 import { getErrorMessage } from '../../../core/utils/errorMessage';
 import { showErrorToast, showInfoToast, showSuccessToast } from '../../../core/utils/toast';
-import { QueueSchedulingError, saveReportToQueue } from '../../../core/services/queueEngine';
-import { MAX_REPORT_DESCRIPTION_LENGTH, MAX_REPORT_IMAGES } from '../home.types';
-
+import { saveReportToQueue } from '../../../core/services/queueEngine';
+import { MAX_REPORT_DESCRIPTION_LENGTH, MAX_REPORT_IMAGES } from '../../../core/queue/types';
 
 const ReportComposer = () => {
     const [description, setDescription] = useState('');
     const [photos, setPhotos] = useState<Asset[]>([]);
     const [busy, setBusy] = useState(false);
 
-    const handlePermissionResult = (
-        permission: 'granted' | 'limited' | 'denied' | 'blocked' | 'unavailable',
-        label: string,
-    ): boolean => {
+    const handlePermissionResult = (permission: 'granted' | 'limited' | 'denied' | 'blocked' | 'unavailable', label: string): boolean => {
         if (permission === 'granted' || permission === 'limited') {
             return true;
         }
         if (permission === 'blocked') {
-            Alert.alert(
-                `${label} access is blocked`,
-                'Allow access in Settings, then try again.',
-                [
-                    { text: 'Not now', style: 'cancel' },
-                    {
-                        text: 'Open Settings',
-                        onPress: () => {
-                            openPermissionSettings().catch(error =>
-                                showErrorToast('Could not open Settings', getErrorMessage(error)),
-                            );
-                        },
+            Alert.alert(`${label} access is blocked`, 'Allow access in Settings, then try again.', [
+                { text: 'Not now', style: 'cancel' },
+                {
+                    text: 'Open Settings',
+                    onPress: () => {
+                        openPermissionSettings().catch(error => showErrorToast('Could not open Settings', getErrorMessage(error)));
                     },
-                ],
-            );
+                },
+            ]);
             return false;
         }
         if (permission === 'denied') {
@@ -66,16 +45,11 @@ const ReportComposer = () => {
             return;
         }
         if (response.errorCode) {
-            showErrorToast(
-                'Could not select photos',
-                response.errorMessage ?? 'Please try selecting the photos again.',
-            );
+            showErrorToast('Could not select photos', response.errorMessage ?? 'Please try selecting the photos again.');
             return;
         }
 
-        const selected = (response.assets ?? []).filter(
-            (asset): asset is Asset & { uri: string } => Boolean(asset.uri),
-        );
+        const selected = (response.assets ?? []).filter((asset): asset is Asset & { uri: string } => Boolean(asset.uri));
         if (selected.length === 0) {
             showErrorToast('No usable photo selected', 'Select a photo that is available on this device.');
             return;
@@ -83,10 +57,7 @@ const ReportComposer = () => {
 
         const remaining = MAX_REPORT_IMAGES - photos.length;
         if (selected.length > remaining) {
-            showErrorToast(
-                'Photo limit reached',
-                `A report can contain up to ${MAX_REPORT_IMAGES} photos. You can add ${remaining} more.`,
-            );
+            showErrorToast('Photo limit reached', `A report can contain up to ${MAX_REPORT_IMAGES} photos. You can add ${remaining} more.`);
             return;
         }
 
@@ -154,7 +125,7 @@ const ReportComposer = () => {
             showErrorToast('Description required', 'Add a short description before saving the report.');
             return;
         }
-        
+
         if (photos.length === 0 || photos.length > MAX_REPORT_IMAGES) {
             showErrorToast('Add 1-5 photos', 'A report needs at least one photo and can contain no more than five.');
             return;
@@ -170,13 +141,7 @@ const ReportComposer = () => {
             setPhotos([]);
             showSuccessToast('Report saved on this device', 'It will upload automatically when a connection is available.');
         } catch (error) {
-            if (error instanceof QueueSchedulingError) {
-                setDescription('');
-                setPhotos([]);
-                showErrorToast('Report saved; upload needs attention', error.message);
-            } else {
-                showErrorToast('Could not save report', getErrorMessage(error));
-            }
+            showErrorToast('Could not save report', getErrorMessage(error));
         } finally {
             setBusy(false);
         }
@@ -185,9 +150,7 @@ const ReportComposer = () => {
     return (
         <View style={styles.card}>
             <AppText variant="h2">New report</AppText>
-            <AppText color={defaultTheme.colors.textSecondary}>
-                Saved on this device first. Upload can continue when you leave the app.
-            </AppText>
+            <AppText color={defaultTheme.colors.textSecondary}>Saved on this device first. Upload can continue when you leave the app.</AppText>
             <TextInput
                 accessibilityLabel="Report description"
                 value={description}
@@ -230,7 +193,8 @@ const ReportComposer = () => {
                                 accessibilityLabel={`Remove photo ${index + 1}`}
                                 onPress={() => setPhotos(current => current.filter((_, photoIndex) => photoIndex !== index))}
                                 disabled={busy}
-                                hitSlop={8}>
+                                hitSlop={8}
+                            >
                                 <AppText color={defaultTheme.colors.error}>Remove</AppText>
                             </Pressable>
                         </View>
@@ -241,12 +205,7 @@ const ReportComposer = () => {
                     Add at least one photo. Large originals are resized on the device to stay under 5 MB.
                 </AppText>
             )}
-            <AppButton
-                title="Save report"
-                onPress={handleSaveReport}
-                loading={busy}
-                disabled={busy || !description.trim() || photos.length === 0}
-            />
+            <AppButton title="Save report" onPress={handleSaveReport} loading={busy} disabled={busy || !description.trim() || photos.length === 0} />
         </View>
     );
 };
@@ -271,8 +230,16 @@ const styles = StyleSheet.create({
     },
     actions: { flexDirection: 'row', gap: defaultTheme.spacing.sm },
     actionButton: { flex: 1, paddingHorizontal: defaultTheme.spacing.sm },
-    photoList: { flexDirection: 'row', flexWrap: 'wrap', gap: defaultTheme.spacing.sm },
-    photoItem: { width: 78, alignItems: 'center', gap: defaultTheme.spacing.xs },
+    photoList: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        gap: defaultTheme.spacing.sm,
+    },
+    photoItem: {
+        width: 78,
+        alignItems: 'center',
+        gap: defaultTheme.spacing.xs,
+    },
     preview: { width: 72, height: 72, borderRadius: defaultTheme.radius.sm },
 });
 

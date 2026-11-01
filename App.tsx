@@ -5,13 +5,12 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import Toast from 'react-native-toast-message';
 import { store } from './src/store/store';
 import RootNavigator from './src/navigation/root/RootNavigator';
-import { initQueueNetworkListener, initializeQueue, processQueue } from './src/core/services/queueEngine';
+import { initializeQueue, processQueue } from './src/core/services/queueEngine';
 import { getErrorMessage } from './src/core/utils/errorMessage';
 import { showErrorToast } from './src/core/utils/toast';
 
 const App = () => {
     useEffect(() => {
-        const unsubscribeNet = initQueueNetworkListener();
         const appStateSubscription = AppState.addEventListener('change', state => {
             if (state === 'active') {
                 processQueue().catch(error => {
@@ -25,7 +24,6 @@ const App = () => {
         });
 
         return () => {
-            unsubscribeNet();
             appStateSubscription.remove();
         };
     }, []);

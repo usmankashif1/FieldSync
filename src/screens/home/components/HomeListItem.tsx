@@ -4,7 +4,7 @@ import AppText from '../../../components/AppText';
 import { defaultTheme } from '../../../core/theme/defaultTheme';
 import type { HomeItem } from '../home.types';
 
-const HomeListItem = ({ item }: { item: HomeItem }) => (
+const HomeListItem = React.memo(({ item }: { item: HomeItem }) => (
     <View style={styles.card}>
         <AppText variant="title">{item.description}</AppText>
         <AppText variant="caption" color={defaultTheme.colors.textSecondary}>
@@ -27,7 +27,7 @@ const HomeListItem = ({ item }: { item: HomeItem }) => (
             </ScrollView>
         ) : null}
     </View>
-);
+));
 
 const styles = StyleSheet.create({
     card: {

@@ -1,21 +1,36 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# FieldSync - Field Report Technical Test
 
-# Environment configuration
+FieldSync is a React Native CLI app for field workers who need to submit reports from unreliable networks. A report contains a short description and one to five photos. The app saves the report on the device, prepares images under the 5MB limit, uploads them to Supabase, and shows local queue state separately from records fetched from the server.
 
-1. Copy `.env.example` to `.env` in the project root.
-2. Set `SUPABASE_URL` and `SUPABASE_ANON_KEY` to your Supabase project URL and publishable/anon key.
-3. Keep `.env` local; it is ignored by Git. Never put a Supabase secret or service-role key in the mobile app because app values can be extracted from a build.
-4. Rebuild the native app after changing environment values. Metro reload alone does not update native configuration.
+The required background-transfer implementation is Android-only. The iOS background uploader is a documented gap; the app must not be presented as having Android-equivalent iOS upload behavior.
 
-Android reads `.env` through `react-native-config`. On iOS, install native dependencies with `cd ios && pod install` on macOS before building. For another environment file, set `ENVFILE` when building (for example, `ENVFILE=.env.staging`).
+## What the app does
 
-## Field reports
+- Compose a report with a required description and one to five photos, using the camera or photo library.
+- Save a report to the local queue before preparing or sending its photos.
+- Compress selected photos and verify each final file is no larger than 5,000,000 bytes.
+- Upload photos and the report row to Supabase.
+- Show local save/upload progress, per-photo status, and actionable failures.
+- Fetch server history from Supabase separately from the local queue.
+- Retry failed reports and resume eligible work when connectivity returns or the app is opened again.
+- Clear local report history and local compressed copies without deleting server records.
 
-The field-report upload pipeline in this technical test is Android-native. Android is the required platform in the brief; the iOS app does not yet have an equivalent background-upload implementation.
 
-### Supabase setup
+## Technical-test acceptance scenario
 
-Create a public Storage bucket named `field-reports`, then create the reports table:
+The brief's primary scenario is to enable airplane mode, save three reports (including one report with five camera photos), force-quit and reopen the app, restore a throttled connection, interrupt it twice during upload, and verify that the server eventually contains all three reports and their photos.
+
+ 
+
+## Supabase setup
+
+1. Create a Supabase project.
+2. Create a **public** Storage bucket named `field-reports`.
+3. Create the reports table and test policies below.
+4. Copy `.env.example` to `.env` and set `SUPABASE_URL` and `SUPABASE_ANON_KEY` to the project URL and publishable/anon key.
+5. Rebuild the app.
+
+The table used by the app:
 
 ```sql
 create table public.reports (
@@ -47,123 +62,85 @@ create policy "field report photos can be checked for idempotent upload"
   using (bucket_id = 'field-reports');
 ```
 
-The app uses an anon/publishable key and no login, as allowed by the brief. These open policies are for the technical test only; a production app must identify users and restrict rows, storage paths, and upload rates to those users. Never put a Supabase secret or service-role key in the app.
+These permissive policies and a public bucket are for this technical test only. They are not a production authorization design. A production app should authenticate users and restrict report rows, object paths, and upload rates. Never put a Supabase secret or service-role key in the mobile app; use only the publishable/anon key.
 
-### Upload and recovery behavior
+## How to make failures happen
 
-- A report must have a non-blank description and 1-5 photos.
-- Before a report is shown as saved, Android copies each photo into private app storage, corrects its orientation, resizes/compresses it, and checks the resulting file is no larger than 5,000,000 bytes.
-- The report queue is written atomically to app-private storage. Android WorkManager uploads it with a network requirement and a visible background-work notification. WorkManager persists scheduled work over normal process death and device reboot.
-- Photos use a stable path per report/photo and are uploaded with replace enabled. Each new report gets a UUID string in the table's unique `id` column; PostgREST upsert means retrying after a lost response does not create another report.
-- Network failures, timeouts, HTTP 408/425/429, and server 5xx responses are retried with exponential backoff. Other HTTP failures are surfaced for the user to review; the user can explicitly try again after fixing the cause.
-- The home screen separates the device queue from reports fetched from Supabase. Clearing local history deletes local reports and photo copies only; it does not delete server records or objects.
+The brief asks that failure be testable on demand. Use a test project, not production data.
 
-Android prevents background work after the user explicitly force-stops an app. In that case the saved queue remains intact and resumes when the user opens the app again. A normal process kill or device reboot is different: WorkManager can restart eligible work when Android permits it.
+### Offline and interrupted connection
 
-### Verification checklist
+- Turn on airplane mode, save one or more reports, and confirm they appear in **On this device** without claiming they have uploaded.
+- Restore Wifi and observe the upload status.
+- While a photo is transferring, disable the active connection and then restore it.
 
-1. Save a report in airplane mode, force-stop the app, reopen it, restore a connection, and verify it reaches Supabase without another tap.
-2. Queue multiple reports, including five large camera photos; confirm each stored image is at most 5 MB and remains viewable.
-3. Background the app during upload and reboot with queued work; verify Android resumes the queue when network is available.
-4. Interrupt the connection during upload, restore it, and confirm the same report ID and deterministic photo paths are reused.
-5. Remove an anon insert/upload policy to simulate a permanent authorization failure; the report should show an actionable failure rather than retrying endlessly. Restore the policy and use **Try again**.
-6. Try an empty description, zero photos, and a sixth photo; the composer must not save an invalid report.
-7. Deny camera/photo access, grant it later in Settings, and retry without restarting the app.
+ 
 
-To exercise transient server errors or a hanging endpoint on demand, use a controllable network proxy or a test backend in the Android emulator. A normal internet disconnect tests the connection-loss path, but does not simulate a server returning an HTTP error.
+## Architecture and implementation decisions
 
-# Getting Started
+### Ownership boundaries
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+- `QueueManager` is a screen-independent TypeScript class. It owns report validation, local queue lifecycle, image-preparation orchestration, state transitions, retry classification, and retry timing.
+- `StorageAdapter` persists queue records through AsyncStorage. Compressed image files are stored in the app documents directory and are removed when local history is cleared.
+- `ImageCompressor` is a TypeScript adapter around `react-native-compressor`. It applies a JPEG quality/dimension policy, checks the actual file size, and persists the accepted result through `react-native-fs`.
+- `NetworkMonitor` wraps NetInfo. A network transition to online asks the queue manager to resume work.
+- `UploadAdapter` isolates network upload from the queue manager and UI. The manager can be tested using fake storage, compressor, network, and uploader adapters without rendering React components.
+- The screen renders queue records from local storage and server history from a separate Supabase query. A local “saved” state and a server “uploaded” state are deliberately distinct.
 
-## Step 1: Start Metro
+### Image preparation
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+The app accepts large originals as input. For each photo, TypeScript asks the compressor to produce JPEG output, starting at up to 2048 pixels and trying decreasing quality values. If needed, it reduces the dimension and tries again down to 512 pixels. It verifies the produced file and its durable copy against the hard limit of 5,000,000 bytes before allowing upload.
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+The compression library uses platform image APIs internally, but the queue and compression policy are orchestrated in TypeScript. Android's WorkManager worker does not compress, resize, or make image-quality decisions. Compression can take time and may use device resources; the queue record is saved before compression begins.
 
-```sh
-# Using npm
-npm start
+### Android background file transfer
 
-# OR using Yarn
-yarn start
-```
+`BackgroundUploadAdapter` is the only queue component that calls the Android native transfer bridge. The bridge schedules one uniquely named WorkManager task per report/photo. A worker receives a local compressed-file path, upload URL, report ID, content type, and publishable key; it transfers that file and exposes progress and the HTTP result through WorkManager.
 
-## Step 2: Build and run your app
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+Native code does **not** own the report queue, compression, retry count/backoff policy, duplicate detection, or report-row submission. TypeScript submits the report row after its photos succeed.
 
-### Android
+### Retry and duplicate behavior
 
-```sh
-# Using npm
-npm run android
+- Network/transport failures, timeouts, HTTP 408, 425, 429, and HTTP 5xx are retryable.
+- Other HTTP failures are surfaced as permanent until the user chooses **Try again**.
+- Each photo uses a deterministic Storage object path based on report ID and photo index, with replace enabled. A retry may transfer the same photo again, but it replaces the same object rather than creating a second path.
+- Each report has a stable client-generated ID in the table primary key. The report row is upserted on that ID, so a retry after an uncertain response updates the same row.
 
-# OR using Yarn
-yarn android
-```
+This prevents duplicate logical report rows and duplicate object paths when the configured backend honors upsert/replace semantics. It is not a claim that the network can never send the same bytes more than once.
 
-### iOS
+### Local history and reset semantics
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
+The **On this device** list represents local queue records. **Received by server** is fetched from Supabase and is not inferred from the local queue. **Clear** cancels report transfers and removes local queue data and compressed copies; it does not delete already-uploaded server rows or Storage objects. The confirmation text explains that pending local work will be discarded.
 
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+ 
+ 
+## Verification
 
-```sh
-bundle install
-```
+1. Queue three reports in airplane mode, including a report with five large camera photos.
+2. Force-stop and reopen the app; restore a throttled connection and confirm which already-scheduled work resumes.
+3. Drop the connection twice during upload.
+4. Confirm every stored photo is at most 5,000,000 bytes and visually usable, and verify one report row per report ID in Supabase.
+5. Deny camera/photo permissions, grant them later in Settings, and retry without restarting.
+6. Try an empty description, zero photos, and a sixth photo.
+7. Test a permanent authorization failure, a transient server error, and a hanging request. Confirm only retryable errors are automatically retried.
+8. Clear local history and verify that the documented local-only reset behavior matches the backend.
 
-Then, and every time you update your native dependencies, run:
+Automated tests and a successful Android build do not prove real carrier connectivity, force-stop behavior across Android versions, or backend policy correctness.
 
-```sh
-bundle exec pod install
-```
+## Decisions, trade-offs, and next steps
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+- **Why Supabase:** it provides a real Storage upload and report-table round trip without spending the limited test time building a custom server. The open test policies are intentionally not presented as production-ready.
+- **Why an adapter-based TypeScript queue:** it keeps report decisions testable without mounting screens and keeps queue logic independent of WorkManager APIs.
+- **Why WorkManager:** the Android brief calls for durable background file transfer. A native scheduler can run eligible work outside the foreground React Native UI; JavaScript alone cannot guarantee that work continues after its runtime is stopped.
+- **Why keep native code small:** Android is responsible for a single file transfer and WorkManager status only. Validation, compression policy, queue decisions, retries, and report persistence belong to TypeScript.
+- **With another day:** implement and test the iOS background `URLSession` bridge; add deterministic integration tests against a controllable backend; improve process-death recovery and observability; run throttled-network and carrier tests on multiple Android versions/devices; and record the requested two-to-three-minute airplane-mode-to-server demo.
+- **Known omissions:** no iOS background uploader, no built-in fault-injection server/proxy, and no production authentication or restrictive per-user backend policies. The JavaScript-owned retry/sequencing model also requires the app runtime to resume after a native task finishes or fails.
 
-```sh
-# Using npm
-npm run ios
+## Submission checklist
 
-# OR using Yarn
-yarn ios
-```
+- Source repository with meaningful commit history.
+- This README with setup steps, backend setup/failure testing, design reasoning, and documented gaps.
+- A two-to-three-minute screen recording. A useful walkthrough is: save reports offline; show they are locally saved rather than uploaded; reopen/restore a throttled connection; show progress and the separate server list updating; interrupt and recover a transfer; then show the final rows/photos in Supabase.
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
-
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
-
-## Step 3: Modify your app
-
-Now that you have successfully run the app, let's make changes!
-
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
-
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+The technical-test scoring rubric is: delivery guarantees 30%, UI/UX judgement 25%, image handling 20%, architecture 15%, and communication 10%.

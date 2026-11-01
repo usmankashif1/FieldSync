@@ -1,247 +1,235 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import NetInfo from '@react-native-community/netinfo';
-import { AppState, NativeModules, Platform } from 'react-native';
-import {
-    MAX_REPORT_DESCRIPTION_LENGTH,
-    MAX_REPORT_IMAGES,
-    type ReportItem,
-} from '../../screens/home/home.types';
-import { getSupabaseConfiguration } from './supabase';
+import { NativeModules, Platform } from 'react-native';
+import { BackgroundUploadAdapter } from '../adapters/BackgroundUploadAdapter';
+import { ReportImageCompressor } from '../adapters/ImageCompressor';
+import { NetInfoMonitor } from '../adapters/NetInfoMonitor';
+import { ReportStorageAdapter } from '../adapters/ReportStorageAdapter';
+import { QueueManager } from '../queue/QueueManager';
+import type { Report, ReportImage } from '../queue/types';
 
 const LEGACY_QUEUE_STORAGE_KEY = '@field_reports_queue_v1';
-const QUEUE_POLL_INTERVAL_MS = 2500;
 
-interface NativeReportQueue {
-    getReports(): Promise<ReportItem[]>;
-    recoverInterruptedUploads(): Promise<void>;
-    enqueueReport(description: string, imageUris: string[]): Promise<ReportItem>;
-    retryReport(reportId: string): Promise<void>;
-    clearQueue(): Promise<void>;
-    migrateLegacyQueue(legacyQueue: string): Promise<void>;
-    scheduleQueue(url: string, anonKey: string, delayMs: number): Promise<void>;
+interface LegacyQueueModule {
+  readLegacyQueue(): Promise<string | null>;
+  finishLegacyQueueMigration(): Promise<void>;
 }
 
-type QueueListener = (reports: ReportItem[]) => void;
-
-export class QueueSchedulingError extends Error {
-    constructor(readonly report: ReportItem, cause: unknown) {
-        const detail = cause instanceof Error ? cause.message : String(cause);
-        super(`The report is saved on this device, but its upload could not be scheduled. ${detail}`);
-        this.name = 'QueueSchedulingError';
-    }
-}
-
-const listeners = new Set<QueueListener>();
-let pollingTimer: ReturnType<typeof setInterval> | undefined;
-let isPolling = false;
-let schedulingPromise: Promise<void> | undefined;
+const storage = new ReportStorageAdapter();
+const network = new NetInfoMonitor();
+const manager = new QueueManager({
+  storage,
+  compressor: new ReportImageCompressor(),
+  uploader: new BackgroundUploadAdapter(),
+  network,
+});
 let migrationPromise: Promise<void> | undefined;
 
-const getNativeQueue = (): NativeReportQueue => {
-    if (Platform.OS !== 'android') {
-        throw new Error('Background report uploads are currently supported on Android only.');
-    }
-
-    const nativeQueue = NativeModules.FieldReportQueue as NativeReportQueue | undefined;
-    if (!nativeQueue) {
-        throw new Error('The native report upload module is unavailable. Rebuild the Android app.');
-    }
-
-    return nativeQueue;
-};
-
-const publishQueue = (reports: ReportItem[]): void => {
-    const snapshot = reports.map(report => ({
-        ...report,
-        images: report.images.map(image => ({ ...image })),
-    }));
-    listeners.forEach(listener => listener(snapshot));
-};
-
-const refreshQueue = async (): Promise<void> => {
-    if (isPolling || AppState.currentState !== 'active' || listeners.size === 0) {
-        return;
-    }
-
-    isPolling = true;
-    try {
-        publishQueue(await getNativeQueue().getReports());
-    } catch (error) {
-        console.error('Could not refresh the local report queue:', error);
-    } finally {
-        isPolling = false;
-    }
-};
-
-const ensureLegacyQueueMigrated = (): Promise<void> => {
-    if (migrationPromise) {
-        return migrationPromise;
-    }
-
-    migrationPromise = (async () => {
-        const legacyQueue = await AsyncStorage.getItem(LEGACY_QUEUE_STORAGE_KEY);
-        if (!legacyQueue) {
-            return;
-        }
-
-        await getNativeQueue().migrateLegacyQueue(legacyQueue);
-        await AsyncStorage.removeItem(LEGACY_QUEUE_STORAGE_KEY);
-    })().catch(error => {
-        migrationPromise = undefined;
-        throw error;
-    });
-
-    return migrationPromise;
-};
-
-const scheduleQueue = async (delayMs = 0): Promise<void> => {
-    const { url, anonKey } = getSupabaseConfiguration();
-    await getNativeQueue().scheduleQueue(url, anonKey, delayMs);
-};
-
-/**
- * Migrates previously queued reports, then asks Android to resume durable work.
- */
 export const initializeQueue = async (): Promise<void> => {
-    await ensureLegacyQueueMigrated();
-    await getNativeQueue().recoverInterruptedUploads();
-    await processQueue();
+  await network.initialize();
+  await migrateLegacyQueue();
+  await manager.processQueue();
 };
 
-/**
- * Reads the device-persisted queue. Server history is loaded separately.
- */
-export const getLocalQueue = async (): Promise<ReportItem[]> => {
-    await ensureLegacyQueueMigrated();
-    return getNativeQueue().getReports();
+export const getLocalQueue = async (): Promise<Report[]> => {
+  await migrateLegacyQueue();
+  return manager.loadAll();
 };
 
-/**
- * Subscribes to native queue updates while the app is in the foreground.
- */
-export const subscribeToQueue = (listener: QueueListener): (() => void) => {
-    listeners.add(listener);
-    refreshQueue();
+export const subscribeToQueue = (
+  listener: (reports: Report[]) => void,
+): (() => void) => manager.subscribe(listener);
 
-    if (!pollingTimer) {
-        pollingTimer = setInterval(() => {
-            refreshQueue();
-        }, QUEUE_POLL_INTERVAL_MS);
-    }
-
-    return () => {
-        listeners.delete(listener);
-        if (listeners.size === 0 && pollingTimer) {
-            clearInterval(pollingTimer);
-            pollingTimer = undefined;
-        }
-    };
-};
-
-/**
- * Saves a durable report before scheduling its background upload.
- */
 export const saveReportToQueue = async (
-    description: string,
-    imageUris: string[],
-): Promise<ReportItem> => {
-    const cleanDescription = description.trim();
-    if (!cleanDescription) {
-        throw new Error('Enter a description before saving the report.');
-    }
-    if (cleanDescription.length > MAX_REPORT_DESCRIPTION_LENGTH) {
-        throw new Error(`A report description can contain no more than ${MAX_REPORT_DESCRIPTION_LENGTH} characters.`);
-    }
-    if (imageUris.length === 0) {
-        throw new Error('Select at least one photo before saving the report.');
-    }
-    if (imageUris.length > MAX_REPORT_IMAGES) {
-        throw new Error(`A report can contain no more than ${MAX_REPORT_IMAGES} photos.`);
-    }
-
-    await ensureLegacyQueueMigrated();
-    const report = await getNativeQueue().enqueueReport(cleanDescription, imageUris);
-    refreshQueue();
-
-    try {
-        await scheduleQueue();
-    } catch (error) {
-        throw new QueueSchedulingError(report, error);
-    }
-
-    return report;
+  description: string,
+  imageUris: string[],
+): Promise<Report> => {
+  await migrateLegacyQueue();
+  return manager.saveReport(description, imageUris);
 };
 
-/**
- * Explicitly retries a report after the user has reviewed its failure.
- */
 export const retryReport = async (reportId: string): Promise<void> => {
-    await ensureLegacyQueueMigrated();
-    await getNativeQueue().retryReport(reportId);
-    const reports = await getNativeQueue().getReports();
-    publishQueue(reports);
-    const retriedReport = reports.find(report => report.id === reportId);
-    if (!retriedReport) {
-        throw new Error('The report was not found after its retry was saved.');
-    }
-
-    try {
-        await scheduleQueue();
-    } catch (error) {
-        throw new QueueSchedulingError(retriedReport, error);
-    }
+  await migrateLegacyQueue();
+  await manager.retryReport(reportId);
 };
 
-/**
- * Clears local queue history and local photo copies; server data is unchanged.
- */
 export const clearLocalQueue = async (): Promise<void> => {
-    await ensureLegacyQueueMigrated();
-    await getNativeQueue().clearQueue();
-    publishQueue([]);
+  await migrateLegacyQueue();
+  await manager.clearQueue();
 };
 
-/**
- * Schedules durable Android work for any report that is not terminal.
- */
-export const processQueue = (): Promise<void> => {
-    if (schedulingPromise) {
-        return schedulingPromise;
+export const processQueue = async (): Promise<void> => {
+  await migrateLegacyQueue();
+  await manager.processQueue();
+};
+
+async function migrateLegacyQueue(): Promise<void> {
+  if (migrationPromise) {
+    return migrationPromise;
+  }
+  migrationPromise = migrateLegacyQueueOnce().catch(error => {
+    migrationPromise = undefined;
+    throw error;
+  });
+  return migrationPromise;
+}
+
+async function migrateLegacyQueueOnce(): Promise<void> {
+  const nativeQueue = getLegacyQueueModule();
+  const nativeSerialized = nativeQueue
+    ? await nativeQueue.readLegacyQueue()
+    : null;
+  const asyncSerialized = await AsyncStorage.getItem(LEGACY_QUEUE_STORAGE_KEY);
+  const currentReports = await storage.loadAll();
+  const knownIds = new Set(currentReports.map(report => report.id));
+  const legacyReports = [
+    ...(nativeSerialized ? parseLegacyReports(nativeSerialized) : []),
+    ...(asyncSerialized ? parseLegacyReports(asyncSerialized) : []),
+  ];
+
+  for (const legacyValue of legacyReports) {
+    const report = convertLegacyReport(legacyValue);
+    if (!knownIds.has(report.id)) {
+      await storage.save(report);
+      knownIds.add(report.id);
     }
+  }
 
-    schedulingPromise = (async () => {
-        await ensureLegacyQueueMigrated();
-        const reports = await getNativeQueue().getReports();
-        const hasWork = reports.some(report =>
-            report.status === 'queued' ||
-            report.status === 'uploading' ||
-            report.status === 'retrying' ||
-            (report.status === 'failed' && report.retryable),
+  if (asyncSerialized !== null) {
+    await AsyncStorage.removeItem(LEGACY_QUEUE_STORAGE_KEY);
+  }
+  if (nativeQueue) {
+    await nativeQueue.finishLegacyQueueMigration();
+  }
+}
+
+function getLegacyQueueModule(): LegacyQueueModule | undefined {
+  if (Platform.OS !== 'android') {
+    return undefined;
+  }
+  const module = NativeModules.BackgroundTransfer as
+    | Partial<LegacyQueueModule>
+    | undefined;
+  if (
+    !module ||
+    typeof module.readLegacyQueue !== 'function' ||
+    typeof module.finishLegacyQueueMigration !== 'function'
+  ) {
+    throw new Error(
+      'The Android background transfer module is unavailable. Rebuild the app to restore saved reports.',
+    );
+  }
+  return module as LegacyQueueModule;
+}
+
+function parseLegacyReports(serialized: string): unknown[] {
+  const parsed: unknown = JSON.parse(serialized);
+  if (!Array.isArray(parsed)) {
+    throw new Error('A saved report queue has an invalid format.');
+  }
+  return parsed;
+}
+
+function convertLegacyReport(value: unknown): Report {
+  const legacy = asRecord(value);
+  const id = nonEmptyString(legacy.id) ?? createMigrationId();
+  const description =
+    typeof legacy.description === 'string' ? legacy.description.trim() : '';
+  const rawImages = Array.isArray(legacy.images) ? legacy.images : [];
+  const oldUris = Array.isArray(legacy.localImageUris)
+    ? legacy.localImageUris
+    : [];
+  const oldUrls = Array.isArray(legacy.uploadedImageUrls)
+    ? legacy.uploadedImageUrls
+    : [];
+  const images: ReportImage[] =
+    rawImages.length > 0
+      ? rawImages.map((item, index) =>
+          convertLegacyImage(item, oldUris[index], oldUrls[index]),
+        )
+      : oldUris.map((uri, index) =>
+          convertLegacyImage({ uri }, uri, oldUrls[index]),
         );
+  const missingImage = images.some(
+    image => !image.localUri && image.status !== 'uploaded',
+  );
+  const missingDescription = !description;
+  const isLegacySynced = legacy.status === 'synced';
+  const legacyPermanentFailure =
+    legacy.status === 'failed' && legacy.retryable === false;
+  const permanentFailure =
+    !isLegacySynced &&
+    (missingImage || missingDescription || legacyPermanentFailure);
+  return {
+    id,
+    description: description || 'Saved report',
+    images,
+    status: isLegacySynced
+      ? 'uploaded'
+      : permanentFailure
+      ? 'failed_permanent'
+      : 'queued',
+    createdAt:
+      typeof legacy.createdAt === 'number' ? legacy.createdAt : Date.now(),
+    attemptCount: typeof legacy.retryCount === 'number' ? legacy.retryCount : 0,
+    lastAttemptAt:
+      typeof legacy.lastAttemptAt === 'number'
+        ? legacy.lastAttemptAt
+        : undefined,
+    lastError:
+      typeof legacy.error === 'string'
+        ? legacy.error
+        : permanentFailure
+        ? 'A saved report is missing its description or a photo and needs to be recreated.'
+        : undefined,
+  };
+}
 
-        if (hasWork) {
-            await scheduleQueue();
-        }
-    })().finally(() => {
-        schedulingPromise = undefined;
-    });
+function convertLegacyImage(
+  value: unknown,
+  fallbackUri: unknown,
+  fallbackUrl: unknown,
+): ReportImage {
+  const legacy = asRecord(value);
+  const localUri =
+    nonEmptyString(legacy.uri) ??
+    nonEmptyString(legacy.localUri) ??
+    nonEmptyString(fallbackUri) ??
+    '';
+  const url = nonEmptyString(legacy.url) ?? nonEmptyString(fallbackUrl);
+  const status =
+    legacy.status === 'completed' ||
+    legacy.status === 'uploaded' ||
+    Boolean(url)
+      ? 'uploaded'
+      : 'pending';
+  const bytes =
+    typeof legacy.size === 'number'
+      ? legacy.size
+      : typeof legacy.bytes === 'number'
+      ? legacy.bytes
+      : undefined;
+  return {
+    localUri,
+    compressedUri: localUri || undefined,
+    bytes,
+    mimeType: 'image/jpeg',
+    status,
+    url,
+    progress: status === 'uploaded' ? 100 : 0,
+  };
+}
 
-    return schedulingPromise;
-};
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('A saved report has invalid local data.');
+  }
+  return value as Record<string, unknown>;
+}
 
-/**
- * Schedules pending reports promptly when connectivity returns.
- */
-export const initQueueNetworkListener = (): (() => void) =>
-    (() => {
-        let wasOnline = false;
-        return NetInfo.addEventListener(state => {
-            // Carrier networks can fail NetInfo's reachability probe while still passing traffic.
-            // WorkManager's CONNECTED constraint is the authoritative upload gate.
-            const isOnline = state.isConnected === true;
-            if (isOnline && !wasOnline) {
-                processQueue().catch(error => console.error('Could not resume the report queue:', error));
-            }
-            wasOnline = isOnline;
-        });
-    })();
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function createMigrationId(): string {
+  return `migrated-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}

@@ -142,5 +142,3 @@ Automated tests and a successful Android build do not prove real carrier connect
 - Source repository with meaningful commit history.
 - This README with setup steps, backend setup/failure testing, design reasoning, and documented gaps.
 - A two-to-three-minute screen recording. A useful walkthrough is: save reports offline; show they are locally saved rather than uploaded; reopen/restore a throttled connection; show progress and the separate server list updating; interrupt and recover a transfer; then show the final rows/photos in Supabase.
-
-The technical-test scoring rubric is: delivery guarantees 30%, UI/UX judgement 25%, image handling 20%, architecture 15%, and communication 10%.

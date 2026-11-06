@@ -1,7 +1,6 @@
-import NetInfo from '@react-native-community/netinfo';
 import { NativeModules, Platform } from 'react-native';
 import RNFS from 'react-native-fs';
-import { supabase, getSupabaseConfiguration } from '../services/supabase';
+import { getSupabaseConfiguration } from '../services/supabase';
 import {
   MAX_IMAGE_BYTES,
   QueueUploadError,
@@ -11,10 +10,9 @@ import {
   type UploadResult,
 } from '../queue/types';
 
-const REPORT_REQUEST_TIMEOUT_MS = 120_000;
 const TRANSFER_POLL_INTERVAL_MS = 500;
 
-interface TransferStatus {
+interface ReportUploadStatus {
   state:
     | 'ENQUEUED'
     | 'RUNNING'
@@ -24,365 +22,303 @@ interface TransferStatus {
     | 'BLOCKED'
     | 'NOT_FOUND';
   progress: number;
+  imageIndex?: number;
+  imageUrl?: string;
+  imageUrls?: string[];
   successful?: boolean;
   statusCode?: number;
   message?: string;
 }
 
 interface BackgroundTransferNativeModule {
-  startTransfer(
-    taskId: string,
+  startReportUpload(
     reportId: string,
-    filePath: string,
-    uploadUrl: string,
+    description: string,
+    createdAt: string,
+    imagesJson: string,
+    supabaseUrl: string,
     anonKey: string,
-    mimeType: string,
   ): Promise<void>;
-  restartTransfer(
-    taskId: string,
-    reportId: string,
-    filePath: string,
-    uploadUrl: string,
-    anonKey: string,
-    mimeType: string,
-  ): Promise<void>;
-  getTransferStatus(taskId: string): Promise<TransferStatus>;
+  getReportUploadStatus(reportId: string): Promise<ReportUploadStatus>;
   cancelReportTransfers(reportId: string): Promise<void>;
 }
 
-export class BackgroundUploadAdapter implements UploadAdapter {
-  async upload(
-    report: Report,
-    onProgress: (progress: UploadProgress) => Promise<void>,
-  ): Promise<UploadResult> {
-    if (Platform.OS !== 'android') {
-      throw new QueueUploadError(
-        'Background photo uploads are not implemented for iOS yet.',
-        false,
-      );
-    }
+interface PreparedImage {
+  filePath: string;
+  mimeType: string;
+  contentType: string;
+}
 
-    const imageUrls: string[] = [];
-    for (let index = 0; index < report.images.length; index += 1) {
-      const image = report.images[index];
-      if (image.status === 'uploaded' && image.url) {
-        imageUrls.push(image.url);
-        continue;
-      }
-      if (!image.compressedUri || image.bytes === undefined) {
-        throw new QueueUploadError(
-          `Photo ${index + 1} has not been prepared.`,
-          false,
-        );
-      }
+const toFilePath = (uri: string): string =>
+  uri.startsWith('file://')
+    ? decodeURIComponent(uri.slice('file://'.length))
+    : uri;
 
-      const filePath = toFilePath(image.compressedUri);
-      let imageSize: number;
-      try {
-        imageSize = Number((await RNFS.stat(filePath)).size);
-      } catch (statError) {
-        throw new QueueUploadError(
-          `The saved copy of photo ${
-            index + 1
-          } is not available: ${errorMessage(statError)}`,
-          false,
-        );
-      }
-      if (imageSize > MAX_IMAGE_BYTES || image.bytes > MAX_IMAGE_BYTES) {
-        throw new QueueUploadError(
-          `Photo ${index + 1} exceeds the 5,000,000-byte limit.`,
-          false,
-        );
-      }
-      const publicUrl = await this.uploadImage(
-        report.id,
-        index,
-        filePath,
-        image.mimeType ?? 'image/jpeg',
-        onProgress,
-      );
-      imageUrls.push(publicUrl);
-    }
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
 
-    const request = new AbortController();
-    const timeout = setTimeout(
-      () => request.abort(),
-      REPORT_REQUEST_TIMEOUT_MS,
+const delay = (milliseconds: number): Promise<void> =>
+  new Promise(resolve => setTimeout(resolve, milliseconds));
+
+const makeHttpError = (
+  message: string,
+  statusCode?: string | number,
+): QueueUploadError => {
+  const status = Number(statusCode);
+  const retryable =
+    statusCode === undefined ||
+    status === 0 ||
+    status === 408 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500;
+
+  return new QueueUploadError(message, retryable);
+};
+
+const getNativeModule = (): BackgroundTransferNativeModule => {
+  const nativeModule = NativeModules.BackgroundTransfer as
+    | BackgroundTransferNativeModule
+    | undefined;
+
+  if (!nativeModule) {
+    throw new QueueUploadError(
+      'The Android background transfer module is unavailable. Rebuild the app.',
+      false,
     );
-    let response: Awaited<ReturnType<typeof saveReportRow>>;
-    try {
-      response = await saveReportRow(report, imageUrls, request.signal);
-    } catch (requestError) {
-      if (request.signal.aborted) {
-        throw new QueueUploadError(
-          'The server did not respond before the report upload timed out.',
-          true,
-        );
-      }
-      throw requestError;
-    } finally {
-      clearTimeout(timeout);
-    }
-    const { error, status } = response;
-    if (error) {
-      throw makeHttpError(error.message, status);
-    }
-    return { imageUrls };
   }
+  return nativeModule;
+};
 
-  async cancel(reportId: string): Promise<void> {
-    if (Platform.OS !== 'android') {
-      return;
+const mapStatusError = (status: ReportUploadStatus): QueueUploadError =>
+  makeHttpError(
+    status.message ?? 'The background report upload failed.',
+    status.statusCode,
+  );
+
+const reportProgress = async (
+  status: ReportUploadStatus,
+  imageCount: number,
+  onProgress: (progress: UploadProgress) => Promise<void>,
+): Promise<void> => {
+  const completedImages = new Set<number>();
+  status.imageUrls?.forEach((imageUrl, imageIndex) => {
+    if (imageIndex < imageCount && imageUrl) {
+      completedImages.add(imageIndex);
     }
-    await this.getNativeModule().cancelReportTransfers(reportId);
-  }
-
-  private async uploadImage(
-    reportId: string,
-    imageIndex: number,
-    filePath: string,
-    mimeType: string,
-    onProgress: (progress: UploadProgress) => Promise<void>,
-  ): Promise<string> {
-    const { url, anonKey } = getSupabaseConfiguration();
-    const objectPath = `reports/${reportId}/${imageIndex}.${getExtension(
-      mimeType,
-    )}`;
-    const uploadUrl = `${url.replace(
-      /\/+$/,
-      '',
-    )}/storage/v1/object/field-reports/${encodePath(objectPath)}`;
-    const taskId = `${reportId}-${imageIndex}`;
-    const nativeModule = this.getNativeModule();
-    let previousNetworkType: string | undefined;
-    let disconnected = false;
-    let restartRequested = false;
-    let eventVersion = 0;
-    const unsubscribe = NetInfo.addEventListener(state => {
-      eventVersion += 1;
-      if (state.isConnected !== true) {
-        disconnected = true;
-        previousNetworkType = state.type;
-        return;
-      }
-      if (
-        previousNetworkType !== undefined &&
-        (disconnected || previousNetworkType !== state.type)
-      ) {
-        restartRequested = true;
-      }
-      disconnected = false;
-      previousNetworkType = state.type;
+  });
+  for (const imageIndex of completedImages) {
+    await onProgress({
+      imageIndex,
+      percent: 100,
+      imageUrl: status.imageUrls?.[imageIndex],
     });
-
-    try {
-      const versionBeforeFetch = eventVersion;
-      const currentNetwork = await NetInfo.fetch();
-      if (versionBeforeFetch === eventVersion) {
-        previousNetworkType = currentNetwork.type;
-        disconnected = currentNetwork.isConnected !== true;
-      }
-      await this.schedule(
-        nativeModule.startTransfer,
-        nativeModule,
-        taskId,
-        reportId,
-        filePath,
-        uploadUrl,
-        anonKey,
-        mimeType,
-      );
-
-      let missingTaskCount = 0;
-      let lastProgress = -1;
-      while (true) {
-        let status: TransferStatus;
-        try {
-          status = await nativeModule.getTransferStatus(taskId);
-        } catch (error) {
-          throw new QueueUploadError(
-            `Could not check the background photo transfer: ${errorMessage(
-              error,
-            )}`,
-            true,
-          );
-        }
-
-        if (restartRequested && status.state !== 'SUCCEEDED') {
-          restartRequested = false;
-          await this.schedule(
-            nativeModule.restartTransfer,
-            nativeModule,
-            taskId,
-            reportId,
-            filePath,
-            uploadUrl,
-            anonKey,
-            mimeType,
-          );
-          lastProgress = -1;
-          await onProgress({ imageIndex, percent: 0, waiting: true });
-          continue;
-        }
-        if (status.state === 'SUCCEEDED') {
-          if (!status.successful) {
-            throw makeHttpError(
-              status.message ?? 'The photo upload failed.',
-              status.statusCode,
-            );
-          }
-          const publicUrl = `${url.replace(
-            /\/+$/,
-            '',
-          )}/storage/v1/object/public/field-reports/${objectPath}`;
-          await onProgress({ imageIndex, percent: 100, imageUrl: publicUrl });
-          return publicUrl;
-        }
-        if (
-          status.state === 'FAILED' ||
-          status.state === 'CANCELLED' ||
-          status.state === 'BLOCKED'
-        ) {
-          throw makeHttpError(
-            status.message ??
-              'The background photo transfer stopped and will be retried.',
-            status.statusCode,
-          );
-        }
-        if (status.state === 'NOT_FOUND') {
-          if (missingTaskCount > 0) {
-            throw new QueueUploadError(
-              'The background transfer could not be found.',
-              true,
-            );
-          }
-          missingTaskCount += 1;
-          await this.schedule(
-            nativeModule.startTransfer,
-            nativeModule,
-            taskId,
-            reportId,
-            filePath,
-            uploadUrl,
-            anonKey,
-            mimeType,
-          );
-          continue;
-        }
-        if (status.progress !== lastProgress) {
-          await onProgress({
-            imageIndex,
-            percent: status.progress,
-            waiting: status.state === 'ENQUEUED',
-          });
-          lastProgress = status.progress;
-        }
-        await delay(TRANSFER_POLL_INTERVAL_MS);
-      }
-    } finally {
-      unsubscribe();
-    }
   }
 
-  private getNativeModule(): BackgroundTransferNativeModule {
-    const nativeModule = NativeModules.BackgroundTransfer as
-      | BackgroundTransferNativeModule
-      | undefined;
-    if (!nativeModule) {
+  const index = status.imageIndex;
+  if (
+    index === undefined ||
+    index < 0 ||
+    index >= imageCount ||
+    (completedImages.has(index) && status.progress >= 100)
+  ) {
+    return;
+  }
+
+  await onProgress({
+    imageIndex: index,
+    percent: status.progress,
+    waiting: status.state === 'ENQUEUED',
+    imageUrl: status.imageUrl,
+  });
+};
+
+const readStatus = async (
+  nativeModule: BackgroundTransferNativeModule,
+  reportId: string,
+): Promise<ReportUploadStatus> => {
+  try {
+    return await nativeModule.getReportUploadStatus(reportId);
+  } catch (error) {
+    throw new QueueUploadError(
+      `Could not check the background report upload: ${errorMessage(error)}`,
+      true,
+    );
+  }
+};
+
+const completedResult = (
+  status: ReportUploadStatus,
+  expectedImageCount: number,
+): UploadResult => {
+  if (
+    !status.successful ||
+    !status.imageUrls
+  ) {
+    throw mapStatusError(status);
+  }
+  if (
+    status.imageUrls.length !== expectedImageCount ||
+    status.imageUrls.some(url => !url)
+  ) {
+    throw new QueueUploadError(
+      'The background report worker returned an incomplete photo list.',
+      false,
+    );
+  }
+  return { imageUrls: status.imageUrls };
+};
+
+const reconcileReport = async (
+  report: Report,
+  onProgress: (progress: UploadProgress) => Promise<void>,
+): Promise<UploadResult | undefined> => {
+  if (Platform.OS !== 'android') {
+    return undefined;
+  }
+
+  const status = await readStatus(getNativeModule(), report.id);
+  await reportProgress(status, report.images.length, onProgress);
+
+  if (status.state === 'SUCCEEDED') {
+    return completedResult(status, report.images.length);
+  }
+  if (status.state === 'FAILED' || status.state === 'BLOCKED') {
+    const error = mapStatusError(status);
+    if (report.status === 'queued') {
+      return undefined;
+    }
+    if (report.status === 'failed_retryable' && report.lastError === error.message) {
+      return undefined;
+    }
+    throw error;
+  }
+  if (status.state === 'CANCELLED') {
+    const error = new QueueUploadError(
+      'The background report upload was cancelled.',
+      true,
+    );
+    if (report.status === 'queued') {
+      return undefined;
+    }
+    if (report.status === 'failed_retryable' && report.lastError === error.message) {
+      return undefined;
+    }
+    throw error;
+  }
+  return undefined;
+};
+
+const prepareImages = async (report: Report): Promise<PreparedImage[]> => {
+  const images: PreparedImage[] = [];
+
+  for (let index = 0; index < report.images.length; index += 1) {
+    const image = report.images[index];
+    if (!image.compressedUri || image.bytes === undefined) {
       throw new QueueUploadError(
-        'The Android background transfer module is unavailable. Rebuild the app.',
+        `Photo ${index + 1} has not been prepared.`,
         false,
       );
     }
-    return nativeModule;
-  }
 
-  private async schedule(
-    scheduleTransfer: BackgroundTransferNativeModule['startTransfer'],
-    nativeModule: BackgroundTransferNativeModule,
-    taskId: string,
-    reportId: string,
-    filePath: string,
-    uploadUrl: string,
-    anonKey: string,
-    mimeType: string,
-  ): Promise<void> {
+    const filePath = toFilePath(image.compressedUri);
+    let imageSize: number;
     try {
-      await scheduleTransfer.call(
-        nativeModule,
-        taskId,
-        reportId,
-        filePath,
-        uploadUrl,
-        anonKey,
-        mimeType,
-      );
+      imageSize = Number((await RNFS.stat(filePath)).size);
     } catch (error) {
       throw new QueueUploadError(
-        `Could not schedule the photo transfer: ${errorMessage(error)}`,
+        `The saved copy of photo ${
+          index + 1
+        } is not available: ${errorMessage(error)}`,
+        false,
+      );
+    }
+
+    if (
+      imageSize > MAX_IMAGE_BYTES ||
+      image.bytes > MAX_IMAGE_BYTES
+    ) {
+      throw new QueueUploadError(
+        `Photo ${index + 1} exceeds the 5,000,000-byte limit.`,
+        false,
+      );
+    }
+
+    images.push({
+      filePath,
+      mimeType: image.mimeType ?? 'image/jpeg',
+      contentType: 'image/jpeg',
+    });
+  }
+
+  return images;
+};
+
+const uploadReport = async (
+  report: Report,
+  onProgress: (progress: UploadProgress) => Promise<void>,
+): Promise<UploadResult> => {
+  if (Platform.OS !== 'android') {
+    throw new QueueUploadError(
+      'Background photo uploads are not implemented for iOS yet.',
+      false,
+    );
+  }
+
+  const nativeModule = getNativeModule();
+  const images = await prepareImages(report);
+  const { url, anonKey } = getSupabaseConfiguration();
+  try {
+    await nativeModule.startReportUpload(
+      report.id,
+      report.description,
+      new Date(report.createdAt).toISOString(),
+      JSON.stringify(images),
+      url,
+      anonKey,
+    );
+  } catch (error) {
+    throw new QueueUploadError(
+      `Could not schedule the report upload: ${errorMessage(error)}`,
+      true,
+    );
+  }
+
+  while (true) {
+    const status = await readStatus(nativeModule, report.id);
+    await reportProgress(status, report.images.length, onProgress);
+
+    if (status.state === 'SUCCEEDED') {
+      return completedResult(status, report.images.length);
+    }
+    if (status.state === 'FAILED' || status.state === 'BLOCKED') {
+      throw mapStatusError(status);
+    }
+    if (status.state === 'CANCELLED') {
+      throw new QueueUploadError(
+        'The background report upload was cancelled.',
         true,
       );
     }
+    if (status.state === 'NOT_FOUND') {
+      throw new QueueUploadError(
+        'The background report upload could not be found.',
+        true,
+      );
+    }
+
+    await delay(TRANSFER_POLL_INTERVAL_MS);
   }
-}
+};
 
-function makeHttpError(
-  message: string,
-  statusCode?: string | number,
-): QueueUploadError {
-  const status = Number(statusCode);
-  return new QueueUploadError(
-    message,
-    statusCode === undefined ||
-      status === 0 ||
-      status === 408 ||
-      status === 425 ||
-      status === 429 ||
-      status >= 500,
-  );
-}
+const cancelReport = async (reportId: string): Promise<void> => {
+  if (Platform.OS === 'android') {
+    await getNativeModule().cancelReportTransfers(reportId);
+  }
+};
 
-function saveReportRow(
-  report: Report,
-  imageUrls: string[],
-  signal: AbortSignal,
-) {
-  return supabase
-    .from('reports')
-    .upsert(
-      {
-        id: report.id,
-        description: report.description,
-        image_urls: imageUrls,
-        created_at: new Date(report.createdAt).toISOString(),
-      },
-      { onConflict: 'id' },
-    )
-    .abortSignal(signal);
-}
-
-function getExtension(mimeType: string): string {
-  if (mimeType === 'image/png') return 'png';
-  if (mimeType === 'image/webp') return 'webp';
-  if (mimeType === 'image/heic') return 'heic';
-  if (mimeType === 'image/heif') return 'heif';
-  return 'jpg';
-}
-
-function encodePath(path: string): string {
-  return path.split('/').map(encodeURIComponent).join('/');
-}
-
-function toFilePath(uri: string): string {
-  return uri.startsWith('file://')
-    ? decodeURIComponent(uri.slice('file://'.length))
-    : uri;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, milliseconds));
-}
+export const backgroundUploadAdapter: UploadAdapter = {
+  upload: uploadReport,
+  reconcile: reconcileReport,
+  cancel: cancelReport,
+};

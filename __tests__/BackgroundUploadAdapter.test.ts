@@ -1,13 +1,9 @@
 import { NativeModules, Platform } from 'react-native';
-import NetInfo, {
-  type NetInfoChangeHandler,
-  type NetInfoState,
-} from '@react-native-community/netinfo';
 import RNFS from 'react-native-fs';
-import { BackgroundUploadAdapter } from '../src/core/adapters/BackgroundUploadAdapter';
+import { backgroundUploadAdapter } from '../src/core/adapters/BackgroundUploadAdapter';
 import { QueueUploadError } from '../src/core/queue/types';
 import type { Report } from '../src/core/queue/types';
-import { supabase } from '../src/core/services/supabase';
+import { getSupabaseConfiguration } from '../src/core/services/supabase';
 
 jest.mock('react-native-fs', () => ({
   __esModule: true,
@@ -16,36 +12,23 @@ jest.mock('react-native-fs', () => ({
   },
 }));
 
-jest.mock('@react-native-community/netinfo', () => ({
-  __esModule: true,
-  default: {
-    addEventListener: jest.fn(),
-    fetch: jest.fn(),
-  },
-}));
-
 jest.mock('../src/core/services/supabase', () => ({
-  getSupabaseConfiguration: () => ({
+  getSupabaseConfiguration: jest.fn(() => ({
     url: 'https://example.supabase.co',
-    anonKey: 'test-key',
-  }),
-  supabase: {
-    from: jest.fn(() => ({
-      upsert: jest.fn(() => ({
-        abortSignal: jest.fn(async () => ({ error: null, status: 200 })),
-      })),
-    })),
-  },
+    anonKey: 'test-publishable-key',
+  })),
 }));
 
-describe('BackgroundUploadAdapter', () => {
+describe('backgroundUploadAdapter', () => {
   let nativeModule: {
-    startTransfer: jest.Mock<Promise<void>>;
-    restartTransfer: jest.Mock<Promise<void>>;
-    getTransferStatus: jest.Mock<
+    startReportUpload: jest.Mock<Promise<void>>;
+    getReportUploadStatus: jest.Mock<
       Promise<{
         state: string;
         progress: number;
+        imageIndex?: number;
+        imageUrl?: string;
+        imageUrls?: string[];
         successful?: boolean;
         statusCode?: number;
         message?: string;
@@ -63,93 +46,212 @@ describe('BackgroundUploadAdapter', () => {
     jest.mocked(RNFS.stat).mockResolvedValue({
       size: 1200,
     } as Awaited<ReturnType<typeof RNFS.stat>>);
-    jest.mocked(NetInfo.addEventListener).mockReturnValue(() => undefined);
-    jest.mocked(NetInfo.fetch).mockResolvedValue(networkState('wifi'));
     nativeModule = {
-      startTransfer: jest.fn(async () => undefined),
-      restartTransfer: jest.fn(async () => undefined),
-      getTransferStatus: jest.fn(),
+      startReportUpload: jest.fn(async () => undefined),
+      getReportUploadStatus: jest.fn(),
       cancelReportTransfers: jest.fn(async () => undefined),
     };
     NativeModules.BackgroundTransfer = nativeModule;
   });
 
-  it('uses the native transfer bridge and then saves the report row through the adapter', async () => {
-    nativeModule.getTransferStatus.mockResolvedValue({
+  it('schedules the entire prepared report as one durable native task', async () => {
+    nativeModule.getReportUploadStatus.mockResolvedValue({
       state: 'SUCCEEDED',
       progress: 100,
       successful: true,
-      statusCode: 200,
+      imageUrls: [
+        'https://example.supabase.co/storage/v1/object/public/field-reports/reports/report-1/0.jpg',
+        'https://example.supabase.co/storage/v1/object/public/field-reports/reports/report-1/1.jpg',
+      ],
     });
-    const progress = jest.fn(async () => undefined);
 
-    const result = await new BackgroundUploadAdapter().upload(
+    const result = await backgroundUploadAdapter.upload(
       createReport(),
-      progress,
+      jest.fn(async () => undefined),
     );
 
-    expect(nativeModule.startTransfer).toHaveBeenCalledWith(
-      'report-1-0',
+    expect(nativeModule.startReportUpload).toHaveBeenCalledTimes(1);
+    expect(nativeModule.startReportUpload).toHaveBeenCalledWith(
       'report-1',
-      '/documents/photo.jpg',
-      expect.stringContaining('/storage/v1/object/field-reports/'),
-      'test-key',
-      'image/jpeg',
+      'Damaged sign',
+      new Date(1).toISOString(),
+      JSON.stringify([
+        {
+          filePath: '/documents/photo-0.jpg',
+          mimeType: 'image/jpeg',
+          contentType: 'image/jpeg',
+        },
+        {
+          filePath: '/documents/photo-1.jpg',
+          mimeType: 'image/png',
+          contentType: 'image/jpeg',
+        },
+      ]),
+      'https://example.supabase.co',
+      'test-publishable-key',
     );
-    expect(supabase.from).toHaveBeenCalledWith('reports');
-    expect(result.imageUrls).toEqual([
-      'https://example.supabase.co/storage/v1/object/public/field-reports/reports/report-1/0.jpg',
-    ]);
-    expect(progress).toHaveBeenCalledWith({
-      imageIndex: 0,
-      percent: 100,
-      imageUrl: result.imageUrls[0],
-    });
+    expect(getSupabaseConfiguration).toHaveBeenCalled();
+    expect(result.imageUrls).toHaveLength(2);
   });
 
-  it('replaces an active transfer after a Wi-Fi to cellular route change', async () => {
-    let onNetChange: NetInfoChangeHandler | undefined;
-    jest.mocked(NetInfo.addEventListener).mockImplementation(listener => {
-      onNetChange = listener;
-      return () => undefined;
+  it('passes multiple photos to the worker in report order for sequential uploads', async () => {
+    nativeModule.getReportUploadStatus.mockResolvedValue({
+      state: 'SUCCEEDED',
+      progress: 100,
+      successful: true,
+      imageUrls: ['photo-0-url', 'photo-1-url'],
     });
-    nativeModule.getTransferStatus
-      .mockImplementationOnce(async () => {
-        onNetChange?.(networkState('cellular'));
-        return { state: 'RUNNING', progress: 20 };
+
+    await backgroundUploadAdapter.upload(
+      createReport(),
+      jest.fn(async () => undefined),
+    );
+
+    const images = JSON.parse(
+      nativeModule.startReportUpload.mock.calls[0][3] as string,
+    ) as Array<{ filePath: string }>;
+    expect(images.map(image => image.filePath)).toEqual([
+      '/documents/photo-0.jpg',
+      '/documents/photo-1.jpg',
+    ]);
+    expect(nativeModule.startReportUpload).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for native confirmation after photo progress before resolving the report', async () => {
+    nativeModule.getReportUploadStatus
+      .mockResolvedValueOnce({
+        state: 'RUNNING',
+        progress: 100,
+        imageIndex: 1,
+        imageUrls: ['photo-0-url', 'photo-1-url'],
       })
       .mockResolvedValueOnce({
         state: 'SUCCEEDED',
         progress: 100,
         successful: true,
-        statusCode: 200,
+        imageUrls: ['photo-0-url', 'photo-1-url'],
       });
 
-    await new BackgroundUploadAdapter().upload(
-      createReport(),
-      jest.fn(async () => undefined),
-    );
-
-    expect(nativeModule.restartTransfer).toHaveBeenCalledTimes(1);
+    await expect(
+      backgroundUploadAdapter.upload(
+        createReport(),
+        jest.fn(async () => undefined),
+      ),
+    ).resolves.toEqual({ imageUrls: ['photo-0-url', 'photo-1-url'] });
+    expect(nativeModule.getReportUploadStatus).toHaveBeenCalledTimes(2);
   });
 
-  it('surfaces permanent HTTP errors instead of retrying them as network failures', async () => {
-    nativeModule.getTransferStatus.mockResolvedValue({
-      state: 'SUCCEEDED',
+  it('surfaces a permanent report-row failure from the worker', async () => {
+    nativeModule.getReportUploadStatus.mockResolvedValue({
+      state: 'FAILED',
       progress: 100,
       successful: false,
       statusCode: 403,
-      message: 'Upload permission denied',
+      message: 'Report row permission denied',
     });
 
     await expect(
-      new BackgroundUploadAdapter().upload(
+      backgroundUploadAdapter.upload(
         createReport(),
         jest.fn(async () => undefined),
       ),
     ).rejects.toMatchObject<Partial<QueueUploadError>>({
       retryable: false,
-      message: 'Upload permission denied',
+      message: 'Report row permission denied',
+    });
+  });
+
+  it('surfaces retryable worker network failures with their HTTP status', async () => {
+    nativeModule.getReportUploadStatus.mockResolvedValue({
+      state: 'FAILED',
+      progress: 0,
+      successful: false,
+      statusCode: 503,
+      message: 'Supabase is unavailable',
+    });
+
+    await expect(
+      backgroundUploadAdapter.upload(
+        createReport(),
+        jest.fn(async () => undefined),
+      ),
+    ).rejects.toMatchObject<Partial<QueueUploadError>>({
+      retryable: true,
+      message: 'Supabase is unavailable',
+    });
+  });
+
+  it('replaces a previously failed native task when the queued report is retried', async () => {
+    nativeModule.getReportUploadStatus
+      .mockResolvedValueOnce({
+        state: 'FAILED',
+        progress: 0,
+        statusCode: 503,
+        message: 'Supabase is unavailable',
+      })
+      .mockResolvedValueOnce({
+        state: 'SUCCEEDED',
+        progress: 100,
+        successful: true,
+        imageUrls: ['photo-0-url', 'photo-1-url'],
+      });
+
+    await expect(
+      backgroundUploadAdapter.reconcile?.(
+        { ...createReport(), status: 'queued', lastError: undefined },
+        jest.fn(async () => undefined),
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      backgroundUploadAdapter.upload(
+        { ...createReport(), status: 'queued', lastError: undefined },
+        jest.fn(async () => undefined),
+      ),
+    ).resolves.toEqual({ imageUrls: ['photo-0-url', 'photo-1-url'] });
+
+    expect(nativeModule.startReportUpload).toHaveBeenCalledTimes(1);
+  });
+
+  it('reconciles an upload completed while JavaScript was suspended', async () => {
+    nativeModule.getReportUploadStatus.mockResolvedValue({
+      state: 'SUCCEEDED',
+      progress: 100,
+      successful: true,
+      imageUrls: ['photo-0-url', 'photo-1-url'],
+    });
+
+    await expect(
+      backgroundUploadAdapter.reconcile?.(
+        createReport(),
+        jest.fn(async () => undefined),
+      ),
+    ).resolves.toEqual({ imageUrls: ['photo-0-url', 'photo-1-url'] });
+    expect(nativeModule.startReportUpload).not.toHaveBeenCalled();
+  });
+
+  it('restores completed-photo progress when reconciling active native work', async () => {
+    nativeModule.getReportUploadStatus.mockResolvedValue({
+      state: 'RUNNING',
+      progress: 35,
+      imageIndex: 1,
+      imageUrls: ['photo-0-url'],
+    });
+    const progress = jest.fn(async () => undefined);
+
+    await expect(
+      backgroundUploadAdapter.reconcile?.(createReport(), progress),
+    ).resolves.toBeUndefined();
+
+    expect(progress).toHaveBeenNthCalledWith(1, {
+      imageIndex: 0,
+      percent: 100,
+      imageUrl: 'photo-0-url',
+    });
+    expect(progress).toHaveBeenNthCalledWith(2, {
+      imageIndex: 1,
+      percent: 35,
+      waiting: false,
+      imageUrl: undefined,
     });
   });
 });
@@ -160,10 +262,17 @@ function createReport(): Report {
     description: 'Damaged sign',
     images: [
       {
-        localUri: 'content://photo',
-        compressedUri: 'file:///documents/photo.jpg',
+        localUri: 'content://photo-0',
+        compressedUri: 'file:///documents/photo-0.jpg',
         bytes: 1200,
         mimeType: 'image/jpeg',
+        status: 'pending',
+      },
+      {
+        localUri: 'content://photo-1',
+        compressedUri: 'file:///documents/photo-1.jpg',
+        bytes: 1200,
+        mimeType: 'image/png',
         status: 'pending',
       },
     ],
@@ -171,13 +280,4 @@ function createReport(): Report {
     createdAt: 1,
     attemptCount: 0,
   };
-}
-
-function networkState(type: string): NetInfoState {
-  return {
-    type,
-    isConnected: true,
-    isInternetReachable: true,
-    details: null,
-  } as NetInfoState;
 }

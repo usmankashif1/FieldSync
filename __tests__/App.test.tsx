@@ -3,6 +3,7 @@
  */
 
 import React from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 
 jest.mock('../src/core/services/queueEngine', () => ({
@@ -24,9 +25,30 @@ jest.mock('@react-native-community/netinfo', () => ({
 }));
 
 import App from '../App';
+import { processQueue } from '../src/core/services/queueEngine';
 
 test('renders correctly', async () => {
   await ReactTestRenderer.act(() => {
     ReactTestRenderer.create(<App />);
   });
+});
+
+test('reconciles the saved queue when the app returns to the foreground', async () => {
+  let onAppStateChange: ((state: AppStateStatus) => void) | undefined;
+  const listenerSpy = jest
+    .spyOn(AppState, 'addEventListener')
+    .mockImplementation((_event, listener) => {
+      onAppStateChange = listener;
+      return { remove: jest.fn() };
+    });
+
+  await ReactTestRenderer.act(() => {
+    ReactTestRenderer.create(<App />);
+  });
+  await ReactTestRenderer.act(async () => {
+    onAppStateChange?.('active');
+  });
+
+  expect(processQueue).toHaveBeenCalledTimes(1);
+  listenerSpy.mockRestore();
 });

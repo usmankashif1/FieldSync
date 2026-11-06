@@ -61,6 +61,10 @@ export interface UploadAdapter {
     report: Report,
     onProgress: (progress: UploadProgress) => Promise<void>,
   ): Promise<UploadResult>;
+  reconcile?(
+    report: Report,
+    onProgress: (progress: UploadProgress) => Promise<void>,
+  ): Promise<UploadResult | undefined>;
   cancel(reportId: string): Promise<void>;
 }
 

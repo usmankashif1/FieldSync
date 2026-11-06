@@ -1,6 +1,6 @@
 import { Image } from 'react-native-compressor';
 import RNFS from 'react-native-fs';
-import { ReportImageCompressor } from '../src/core/adapters/ImageCompressor';
+import { imageCompressor } from '../src/core/adapters/ImageCompressor';
 import { QueueUploadError } from '../src/core/queue/types';
 
 jest.mock('react-native-compressor', () => ({
@@ -21,7 +21,7 @@ jest.mock('react-native-fs', () => ({
   },
 }));
 
-describe('ReportImageCompressor', () => {
+describe('imageCompressor', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest
@@ -32,8 +32,8 @@ describe('ReportImageCompressor', () => {
     } as Awaited<ReturnType<typeof RNFS.stat>>);
   });
 
-  it('stores a durable compressed copy and verifies its size against the limit', async () => {
-    const result = await new ReportImageCompressor().compress(
+  it('stores a durable compressed copy and returns the verified output size', async () => {
+    const result = await imageCompressor.compress(
       'content://source/photo',
       5_000_000,
     );
@@ -51,6 +51,7 @@ describe('ReportImageCompressor', () => {
       '/cache/compressed.jpg',
       expect.stringMatching(/^\/documents\/field-report-images\/.+\.jpg$/),
     );
+    expect(RNFS.stat).toHaveBeenCalledTimes(1);
     expect(result.bytes).toBe(1_000_000);
     expect(result.uri).toMatch(/^file:\/\/\/documents\/field-report-images\//);
   });
@@ -61,7 +62,7 @@ describe('ReportImageCompressor', () => {
     } as Awaited<ReturnType<typeof RNFS.stat>>);
 
     await expect(
-      new ReportImageCompressor().compress('content://source/photo', 5_000_000),
+      imageCompressor.compress('content://source/photo', 5_000_000),
     ).rejects.toMatchObject<Partial<QueueUploadError>>({
       retryable: false,
     });

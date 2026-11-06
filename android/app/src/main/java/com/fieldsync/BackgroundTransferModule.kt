@@ -1,19 +1,20 @@
 package com.fieldsync
 
-import android.util.AtomicFile
+import android.util.Base64
+import androidx.work.BackoffPolicy
 import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
-import java.io.FileNotFoundException
+import org.json.JSONObject
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class BackgroundTransferModule(
   private val appContext: ReactApplicationContext,
@@ -23,61 +24,79 @@ class BackgroundTransferModule(
   override fun getName(): String = MODULE_NAME
 
   @ReactMethod
-  fun startTransfer(
-    taskId: String,
+  fun startReportUpload(
     reportId: String,
-    filePath: String,
-    uploadUrl: String,
+    description: String,
+    createdAt: String,
+    imagesJson: String,
+    supabaseUrl: String,
     anonKey: String,
-    mimeType: String,
     promise: Promise,
   ) {
     execute(promise) {
-      enqueueTransfer(taskId, reportId, filePath, uploadUrl, anonKey, mimeType, ExistingWorkPolicy.KEEP)
+      enqueueReport(reportId, description, createdAt, imagesJson, supabaseUrl, anonKey)
       null
     }
   }
 
   @ReactMethod
-  fun restartTransfer(
-    taskId: String,
-    reportId: String,
-    filePath: String,
-    uploadUrl: String,
-    anonKey: String,
-    mimeType: String,
-    promise: Promise,
-  ) {
+  fun getReportUploadStatus(reportId: String, promise: Promise) {
     execute(promise) {
-      enqueueTransfer(taskId, reportId, filePath, uploadUrl, anonKey, mimeType, ExistingWorkPolicy.REPLACE)
-      null
-    }
-  }
-
-  @ReactMethod
-  fun getTransferStatus(taskId: String, promise: Promise) {
-    execute(promise) {
-      require(taskId.isNotBlank()) { "A transfer identifier is required." }
-      val infos = WorkManager.getInstance(appContext)
-        .getWorkInfosForUniqueWork(workName(taskId))
-        .get()
+      require(reportId.isNotBlank()) { "A report identifier is required." }
+      val workManager = WorkManager.getInstance(appContext)
+      val infos = workManager.getWorkInfosForUniqueWork(workName(reportId)).get()
       val info = infos.firstOrNull { !it.state.isFinished } ?: infos.lastOrNull()
       val result = Arguments.createMap()
       if (info == null) {
         result.putString("state", "NOT_FOUND")
         result.putInt("progress", 0)
       } else {
+        val outputData = info.outputData
+        val progressData = info.progress
         result.putString("state", info.state.name)
-        result.putInt("progress", info.progress.getInt(ReportUploadWorker.KEY_PROGRESS, 0))
+        result.putInt(
+          "progress",
+          outputData.getInt(
+            ReportUploadWorker.KEY_PROGRESS,
+            progressData.getInt(ReportUploadWorker.KEY_PROGRESS, 0),
+          ),
+        )
+        result.putInt(
+          "imageIndex",
+          outputData.getInt(
+            ReportUploadWorker.KEY_IMAGE_INDEX,
+            progressData.getInt(ReportUploadWorker.KEY_IMAGE_INDEX, -1),
+          ),
+        )
+        val imageUrl = outputData.getString(ReportUploadWorker.KEY_IMAGE_URL)
+          ?: progressData.getString(ReportUploadWorker.KEY_IMAGE_URL)
+        imageUrl?.let {
+          result.putString("imageUrl", it)
+        }
+        val imageUrlsJson = outputData.getString(ReportUploadWorker.KEY_IMAGE_URLS)
+          ?: progressData.getString(ReportUploadWorker.KEY_IMAGE_URLS)
+        imageUrlsJson?.let { imageUrls ->
+          val urls = Arguments.createArray()
+          val parsedUrls = org.json.JSONArray(imageUrls)
+          for (index in 0 until parsedUrls.length()) {
+            urls.pushString(parsedUrls.getString(index))
+          }
+          result.putArray("imageUrls", urls)
+        }
         result.putBoolean(
           "successful",
-          info.outputData.getBoolean(ReportUploadWorker.KEY_SUCCESSFUL, false),
+          outputData.getBoolean(ReportUploadWorker.KEY_SUCCESSFUL, false),
         )
         result.putInt(
           "statusCode",
-          info.outputData.getInt(ReportUploadWorker.KEY_STATUS_CODE, 0),
+          outputData.getInt(
+            ReportUploadWorker.KEY_STATUS_CODE,
+            progressData.getInt(ReportUploadWorker.KEY_STATUS_CODE, 0),
+          ),
         )
-        info.outputData.getString(ReportUploadWorker.KEY_MESSAGE)?.let {
+        val message = outputData.getString(ReportUploadWorker.KEY_MESSAGE)
+          ?: progressData.getString(ReportUploadWorker.KEY_MESSAGE)
+        message?.let {
           result.putString("message", it)
         }
       }
@@ -94,65 +113,49 @@ class BackgroundTransferModule(
     }
   }
 
-  @ReactMethod
-  fun readLegacyQueue(promise: Promise) {
-    execute(promise) {
-      val file = AtomicFile(appContext.filesDir.resolve(LEGACY_QUEUE_FILE))
-      try {
-        file.openRead().bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
-      } catch (_: FileNotFoundException) {
-        null
-      }
-    }
-  }
-
-  @ReactMethod
-  fun finishLegacyQueueMigration(promise: Promise) {
-    execute(promise) {
-      WorkManager.getInstance(appContext).cancelUniqueWork(LEGACY_WORK_NAME).result.get()
-      AtomicFile(appContext.filesDir.resolve(LEGACY_QUEUE_FILE)).delete()
-      null
-    }
-  }
-
   override fun invalidate() {
     executor.shutdown()
     super.invalidate()
   }
 
-  private fun enqueueTransfer(
-    taskId: String,
+  private fun enqueueReport(
     reportId: String,
-    filePath: String,
-    uploadUrl: String,
+    description: String,
+    createdAt: String,
+    imagesJson: String,
+    supabaseUrl: String,
     anonKey: String,
-    mimeType: String,
-    policy: ExistingWorkPolicy,
   ) {
-    require(taskId.isNotBlank()) { "A transfer identifier is required." }
     require(reportId.isNotBlank()) { "A report identifier is required." }
-    require(filePath.isNotBlank()) { "A local photo path is required." }
-    require(uploadUrl.startsWith("https://")) { "The upload URL must use HTTPS." }
+    require(description.isNotBlank()) { "A report description is required." }
+    require(createdAt.isNotBlank()) { "The report creation time is required." }
+    require(imagesJson.isNotBlank()) { "The prepared photos are missing." }
+    require(supabaseUrl.startsWith("https://")) { "The Supabase URL must use HTTPS." }
     require(anonKey.isNotBlank()) { "The Supabase publishable key is missing." }
-    require(!anonKey.startsWith("sb_secret_") && anonKey != "service_role") {
+    require(isPublishableKey(anonKey)) {
       "A Supabase secret or service-role key cannot be used in a mobile app."
     }
-    require(mimeType.startsWith("image/")) { "The photo content type is invalid." }
 
     val input = Data.Builder()
       .putString(ReportUploadWorker.KEY_REPORT_ID, reportId)
-      .putString(ReportUploadWorker.KEY_FILE_PATH, filePath)
-      .putString(ReportUploadWorker.KEY_UPLOAD_URL, uploadUrl)
+      .putString(ReportUploadWorker.KEY_DESCRIPTION, description)
+      .putString(ReportUploadWorker.KEY_CREATED_AT, createdAt)
+      .putString(ReportUploadWorker.KEY_IMAGES, imagesJson)
+      .putString(ReportUploadWorker.KEY_SUPABASE_URL, supabaseUrl.trimEnd('/'))
       .putString(ReportUploadWorker.KEY_ANON_KEY, anonKey)
-      .putString(ReportUploadWorker.KEY_CONTENT_TYPE, mimeType)
       .build()
     val request = OneTimeWorkRequestBuilder<ReportUploadWorker>()
       .setInputData(input)
       .setConstraints(ReportUploadWorker.networkConstraints())
+      .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, RETRY_BACKOFF_MS, TimeUnit.MILLISECONDS)
       .addTag(reportTag(reportId))
       .build()
-    WorkManager.getInstance(appContext)
-      .enqueueUniqueWork(workName(taskId), policy, request)
+
+    val workManager = WorkManager.getInstance(appContext)
+    if (workManager.getWorkInfosForUniqueWork(workName(reportId)).get().isEmpty()) {
+      workManager.cancelAllWorkByTag(reportTag(reportId)).result.get()
+    }
+    workManager.enqueueUniqueWork(workName(reportId), ExistingWorkPolicy.KEEP, request)
       .result
       .get()
   }
@@ -167,15 +170,33 @@ class BackgroundTransferModule(
     }
   }
 
-  private fun workName(taskId: String): String = "$TRANSFER_WORK_PREFIX$taskId"
+  private fun workName(reportId: String): String = "$REPORT_WORK_PREFIX$reportId"
 
   private fun reportTag(reportId: String): String = "$REPORT_TAG_PREFIX$reportId"
 
+  private fun isPublishableKey(key: String): Boolean {
+    if (key.isBlank() || key.startsWith("sb_secret_") || key == "service_role") {
+      return false
+    }
+    val parts = key.split('.')
+    if (parts.size == 3) {
+      return try {
+        val payload = String(
+          Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_WRAP),
+          StandardCharsets.UTF_8,
+        )
+        JSONObject(payload).optString("role") != "service_role"
+      } catch (_: Exception) {
+        true
+      }
+    }
+    return true
+  }
+
   companion object {
     const val MODULE_NAME = "BackgroundTransfer"
-    private const val TRANSFER_WORK_PREFIX = "field-report-transfer:"
+    private const val REPORT_WORK_PREFIX = "field-report-upload:"
     private const val REPORT_TAG_PREFIX = "field-report:"
-    private const val LEGACY_QUEUE_FILE = "field-report-queue.json"
-    private const val LEGACY_WORK_NAME = "field-report-upload-queue"
+    private const val RETRY_BACKOFF_MS = 30_000L
   }
 }

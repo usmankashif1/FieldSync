@@ -95,14 +95,13 @@ The compression library uses platform image APIs internally, but the queue and c
 
 ### Android background file transfer
 
-`BackgroundUploadAdapter` is the only queue component that calls the Android native transfer bridge. The bridge schedules one uniquely named WorkManager task per report/photo. A worker receives a local compressed-file path, upload URL, report ID, content type, and publishable key; it transfers that file and exposes progress and the HTTP result through WorkManager.
+`BackgroundUploadAdapter` is the only queue component that calls the Android native transfer bridge. After TypeScript has compressed and durably saved every photo, the bridge schedules one uniquely named WorkManager task for the entire report. The native worker uploads those prepared files sequentially, records per-photo progress, and submits the report row to Supabase only after every photo upload succeeds. The task uses the configured publishable/anon key in both the `apikey` and `Authorization: Bearer` headers.
 
-
-Native code does **not** own the report queue, compression, retry count/backoff policy, duplicate detection, or report-row submission. TypeScript submits the report row after its photos succeed.
+WorkManager owns this complete Android workflow, so it does not depend on the React Native JavaScript runtime remaining alive after scheduling. When the app is opened or returns to the foreground, the queue reads native work status and reconciles its local report and photo state. WorkManager retries eligible network and transient server failures; the TypeScript queue preserves the report, handles surfaced failures/backoff, and provides user-triggered retries. Compression remains in TypeScript and completes before any native work is scheduled.
 
 ### Retry and duplicate behavior
 
-- Network/transport failures, timeouts, HTTP 408, 425, 429, and HTTP 5xx are retryable.
+- Network/transport failures, timeouts, HTTP 408, 425, 429, and HTTP 5xx are retryable. The durable worker applies WorkManager backoff while it is active; a surfaced terminal failure remains available for queue retry.
 - Other HTTP failures are surfaced as permanent until the user chooses **Try again**.
 - Each photo uses a deterministic Storage object path based on report ID and photo index, with replace enabled. A retry may transfer the same photo again, but it replaces the same object rather than creating a second path.
 - Each report has a stable client-generated ID in the table primary key. The report row is upserted on that ID, so a retry after an uncertain response updates the same row.
@@ -118,7 +117,7 @@ The **On this device** list represents local queue records. **Received by server
 ## Verification
 
 1. Queue three reports in airplane mode, including a report with five large camera photos.
-2. Force-stop and reopen the app; restore a throttled connection and confirm which already-scheduled work resumes.
+2. Minimize the app while a multi-photo report is uploading, then reopen it and confirm native progress and final queue state are reconciled. Force-stop is different: Android stops the app and does not guarantee scheduled work will run until the user launches the app again; behavior after reopening can vary by Android version and device manufacturer.
 3. Drop the connection twice during upload.
 4. Confirm every stored photo is at most 5,000,000 bytes and visually usable, and verify one report row per report ID in Supabase.
 5. Deny camera/photo permissions, grant them later in Settings, and retry without restarting.
@@ -133,9 +132,9 @@ Automated tests and a successful Android build do not prove real carrier connect
 - **Why Supabase:** it provides a real Storage upload and report-table round trip without spending the limited test time building a custom server. The open test policies are intentionally not presented as production-ready.
 - **Why an adapter-based TypeScript queue:** it keeps report decisions testable without mounting screens and keeps queue logic independent of WorkManager APIs.
 - **Why WorkManager:** the Android brief calls for durable background file transfer. A native scheduler can run eligible work outside the foreground React Native UI; JavaScript alone cannot guarantee that work continues after its runtime is stopped.
-- **Why keep native code small:** Android is responsible for a single file transfer and WorkManager status only. Validation, compression policy, queue decisions, retries, and report persistence belong to TypeScript.
+- **Why keep native code small:** Android owns the durable per-report upload and report-row request, plus WorkManager status. TypeScript retains validation, compression policy, local queue decisions, and UI-facing retry behavior.
 - **With another day:** implement and test the iOS background `URLSession` bridge; add deterministic integration tests against a controllable backend; improve process-death recovery and observability; run throttled-network and carrier tests on multiple Android versions/devices; and record the requested two-to-three-minute airplane-mode-to-server demo.
-- **Known omissions:** no iOS background uploader, no built-in fault-injection server/proxy, and no production authentication or restrictive per-user backend policies. The JavaScript-owned retry/sequencing model also requires the app runtime to resume after a native task finishes or fails.
+- **Known omissions:** no iOS background uploader, no built-in fault-injection server/proxy, and no production authentication or restrictive per-user backend policies. Android force-stop, device-specific background restrictions, and real network behavior still require device testing; this implementation does not claim equivalent iOS background support.
 
 ## Submission checklist
 

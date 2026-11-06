@@ -10,11 +10,28 @@ const MIN_DIMENSION = 512;
 const QUALITY_STEPS = [0.88, 0.8, 0.72, 0.64, 0.56, 0.48, 0.4];
 const OUTPUT_DIRECTORY = `${RNFS.DocumentDirectoryPath}/field-report-images`;
 
-export class ReportImageCompressor implements ImageCompressorContract {
-  async compress(
-    uri: string,
-    maxBytes: number,
-  ): Promise<{ uri: string; bytes: number }> {
+const toFilePath = (uri: string): string => {
+  if (!uri.startsWith('file://')) {
+    return uri;
+  }
+  return decodeURIComponent(uri.slice('file://'.length));
+};
+
+const removeTemporaryFile = async (
+  path: string,
+  sourcePath: string,
+): Promise<void> => {
+  if (path !== sourcePath && (await RNFS.exists(path))) {
+    await RNFS.unlink(path);
+  }
+};
+
+const createFileName = (): string => {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+};
+
+export const imageCompressor: ImageCompressorContract = {
+  compress: async (uri, maxBytes) => {
     try {
       await RNFS.mkdir(OUTPUT_DIRECTORY);
       let dimension = MAX_DIMENSION;
@@ -28,25 +45,23 @@ export class ReportImageCompressor implements ImageCompressorContract {
             quality,
             output: 'jpg',
           });
+
           const compressedPath = toFilePath(compressedUri);
+
           try {
             const stat = await RNFS.stat(compressedPath);
+
             if (Number(stat.size) > maxBytes) {
               continue;
             }
+
             const destination = `${OUTPUT_DIRECTORY}/${createFileName()}.jpg`;
+
             await RNFS.copyFile(compressedPath, destination);
-            const durableStat = await RNFS.stat(destination);
-            if (Number(durableStat.size) > maxBytes) {
-              await RNFS.unlink(destination);
-              throw new QueueUploadError(
-                'The compressed photo exceeds the 5,000,000-byte limit.',
-                false,
-              );
-            }
+
             return {
               uri: `file://${destination}`,
-              bytes: Number(durableStat.size),
+              bytes: Number(stat.size),
             };
           } finally {
             await removeTemporaryFile(compressedPath, toFilePath(uri));
@@ -69,25 +84,5 @@ export class ReportImageCompressor implements ImageCompressorContract {
         false,
       );
     }
-  }
-}
-
-function toFilePath(uri: string): string {
-  if (!uri.startsWith('file://')) {
-    return uri;
-  }
-  return decodeURIComponent(uri.slice('file://'.length));
-}
-
-async function removeTemporaryFile(
-  path: string,
-  sourcePath: string,
-): Promise<void> {
-  if (path !== sourcePath && (await RNFS.exists(path))) {
-    await RNFS.unlink(path);
-  }
-}
-
-function createFileName(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
+  },
+};

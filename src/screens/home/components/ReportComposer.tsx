@@ -15,6 +15,9 @@ const ReportComposer = () => {
     const [photos, setPhotos] = useState<Asset[]>([]);
     const [busy, setBusy] = useState(false);
 
+
+
+
     const handlePermissionResult = (permission: 'granted' | 'limited' | 'denied' | 'blocked' | 'unavailable', label: string): boolean => {
         if (permission === 'granted' || permission === 'limited') {
             return true;
@@ -40,6 +43,11 @@ const ReportComposer = () => {
         return false;
     };
 
+
+
+
+
+
     const addPickedPhotos = (response: ImagePickerResponse): void => {
         if (response.didCancel) {
             return;
@@ -49,26 +57,36 @@ const ReportComposer = () => {
             return;
         }
 
-        const selected = (response.assets ?? []).filter((asset): asset is Asset & { uri: string } => Boolean(asset.uri));
+        const selected = (response.assets ?? []).filter(
+            (asset): asset is Asset & { uri: string } => Boolean(asset.uri),
+        );
+
         if (selected.length === 0) {
             showErrorToast('No usable photo selected', 'Select a photo that is available on this device.');
             return;
         }
 
         const remaining = MAX_REPORT_IMAGES - photos.length;
+
         if (selected.length > remaining) {
             showErrorToast('Photo limit reached', `A report can contain up to ${MAX_REPORT_IMAGES} photos. You can add ${remaining} more.`);
             return;
         }
 
         const existingUris = new Set(photos.map(photo => photo.uri));
+
         const uniquePhotos = selected.filter(photo => !existingUris.has(photo.uri));
+
         if (uniquePhotos.length === 0) {
             showInfoToast('Photo already selected', 'Choose a different photo for this report.');
             return;
         }
         setPhotos(current => [...current, ...uniquePhotos]);
     };
+
+
+
+
 
     const pickFromGallery = async (): Promise<void> => {
         setBusy(true);
@@ -92,6 +110,10 @@ const ReportComposer = () => {
         }
     };
 
+
+
+
+
     const takePhoto = async (): Promise<void> => {
         if (photos.length >= MAX_REPORT_IMAGES) {
             showErrorToast('Photo limit reached', `A report can contain up to ${MAX_REPORT_IMAGES} photos.`);
@@ -106,18 +128,24 @@ const ReportComposer = () => {
             }
 
             const { launchCamera } = require('react-native-image-picker') as typeof import('react-native-image-picker');
+            
             const response = await launchCamera({
                 mediaType: 'photo',
                 quality: 1,
                 saveToPhotos: false,
             });
+
             addPickedPhotos(response);
+
         } catch (error) {
             showErrorToast('Could not open the camera', getErrorMessage(error));
         } finally {
             setBusy(false);
         }
     };
+
+
+
 
     const handleSaveReport = async (): Promise<void> => {
         const cleanDescription = description.trim();
@@ -146,6 +174,8 @@ const ReportComposer = () => {
             setBusy(false);
         }
     };
+
+
 
     return (
         <View style={styles.card}>

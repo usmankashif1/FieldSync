@@ -28,6 +28,7 @@ const HomeScreen = () => {
     const displayedServerError = error
         ? 'Please try again in a moment. Check your internet connection if the problem continues.'
         : null;
+
     const renderServerItem = useCallback<ListRenderItem<HomeItem>>(
         ({ item }) => <HomeListItem item={item} />,
         [],

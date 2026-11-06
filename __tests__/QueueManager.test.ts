@@ -1,4 +1,4 @@
-import { QueueManager } from '../src/core/queue/QueueManager';
+import { createQueueManager } from '../src/core/queue/QueueManager';
 import { QueueUploadError } from '../src/core/queue/types';
 import type {
   ImageCompressor,
@@ -61,7 +61,7 @@ describe('QueueManager', () => {
   let network: FakeNetwork;
   let compressor: jest.Mocked<ImageCompressor>;
   let uploader: jest.Mocked<UploadAdapter>;
-  let manager: QueueManager;
+  let manager: ReturnType<typeof createQueueManager>;
 
   beforeEach(() => {
     storage = new MemoryStorage();
@@ -85,9 +85,10 @@ describe('QueueManager', () => {
           ),
         };
       }),
+      reconcile: jest.fn(async () => undefined),
       cancel: jest.fn(async (_reportId: string) => undefined),
     };
-    manager = new QueueManager({
+    manager = createQueueManager({
       storage,
       compressor,
       uploader,
@@ -187,5 +188,57 @@ describe('QueueManager', () => {
 
     expect(storage.reports[0].status).toBe('failed_permanent');
     expect(storage.reports[0].nextAttemptAt).toBeUndefined();
+  });
+
+  it('retries a durable worker network failure through the saved queue', async () => {
+    network.setOnline(true);
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    jest.mocked(uploader.reconcile!).mockRejectedValueOnce(
+      new QueueUploadError('Supabase returned HTTP 503', true),
+    );
+
+    await manager.saveReport('Damaged sign', ['content://one']);
+    await manager.processQueue();
+
+    expect(storage.reports[0]?.status).toBe('failed_retryable');
+    expect(storage.reports[0]?.lastError).toBe('Supabase returned HTTP 503');
+    expect(storage.reports[0]?.nextAttemptAt).toBe(31_000);
+
+    await manager.retryReport('report-id');
+    await manager.processQueue();
+
+    expect(uploader.upload).toHaveBeenCalledTimes(1);
+    expect(storage.reports[0]?.status).toBe('uploaded');
+  });
+
+  it('reconciles native completion on reopening before checking connectivity', async () => {
+    storage.reports = [
+      {
+        id: 'report-id',
+        description: 'Damaged sign',
+        images: [
+          {
+            localUri: 'content://photo',
+            compressedUri: 'file:///compressed/photo.jpg',
+            bytes: 1200,
+            status: 'uploading',
+            progress: 100,
+          },
+        ],
+        status: 'uploading',
+        createdAt: 1_000,
+        attemptCount: 0,
+      },
+    ];
+    jest.mocked(uploader.reconcile!).mockResolvedValueOnce({
+      imageUrls: ['https://cdn.test/0.jpg'],
+    });
+
+    await manager.processQueue();
+
+    expect(uploader.reconcile).toHaveBeenCalledTimes(1);
+    expect(uploader.upload).not.toHaveBeenCalled();
+    expect(storage.reports[0]?.status).toBe('uploaded');
+    expect(storage.reports[0]?.images[0]?.url).toBe('https://cdn.test/0.jpg');
   });
 });

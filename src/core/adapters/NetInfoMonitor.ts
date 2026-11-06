@@ -1,46 +1,51 @@
 import NetInfo from '@react-native-community/netinfo';
 import type { NetworkMonitor } from '../queue/types';
 
-export class NetInfoMonitor implements NetworkMonitor {
-  private online = false;
-  private eventVersion = 0;
-  private readonly listeners = new Set<(online: boolean) => void>();
-  private readonly unsubscribe: () => void;
+let online = false;
+let eventVersion = 0;
+const listeners = new Set<(online: boolean) => void>();
 
-  constructor() {
-    this.unsubscribe = NetInfo.addEventListener(state => {
-      this.eventVersion += 1;
-      this.setOnline(state.isConnected === true);
-    });
+const setOnline = (nextOnline: boolean): void => {
+  if (online === nextOnline) {
+    return;
   }
+  
+  online = nextOnline;
+  listeners.forEach(listener => listener(nextOnline));
+};
 
-  isOnline(): boolean {
-    return this.online;
-  }
 
-  onChange(listener: (online: boolean) => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
+const unsubscribe = NetInfo.addEventListener(state => {
+  eventVersion += 1;
+  setOnline(state.isConnected === true);
+});
 
-  async initialize(): Promise<void> {
-    const versionBeforeFetch = this.eventVersion;
+
+export const netInfoMonitor = {
+  isOnline: (): boolean => online,
+
+  onChange: (listener: (online: boolean) => void): (() => void) => {
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  },
+
+  initialize: async (): Promise<void> => {
+    const versionBeforeFetch = eventVersion;
     const state = await NetInfo.fetch();
-    if (versionBeforeFetch === this.eventVersion) {
-      this.setOnline(state.isConnected === true);
+    if (versionBeforeFetch === eventVersion) {
+      setOnline(state.isConnected === true);
     }
-  }
+  },
 
-  dispose(): void {
-    this.unsubscribe();
-    this.listeners.clear();
-  }
+  dispose: (): void => {
+    unsubscribe();
+    listeners.clear();
+  },
 
-  private setOnline(online: boolean): void {
-    if (this.online === online) {
-      return;
-    }
-    this.online = online;
-    this.listeners.forEach(listener => listener(online));
-  }
-}
+  
+} satisfies NetworkMonitor & {
+  initialize(): Promise<void>;
+  dispose(): void;
+};

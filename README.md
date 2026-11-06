@@ -1,36 +1,70 @@
-# FieldSync - Field Report Technical Test
+# FieldSync — Field Report App
 
-FieldSync is a React Native CLI app for field workers who need to submit reports from unreliable networks. A report contains a short description and one to five photos. The app saves the report on the device, prepares images under the 5MB limit, uploads them to Supabase, and shows local queue state separately from records fetched from the server.
+FieldSync is a React Native CLI app for creating field reports with a required description and one to five photos. Reports are saved to a local queue first, then uploaded to Supabase. The local queue and server history are shown separately so a locally saved report is not represented as server-delivered.
 
-The required background-transfer implementation is Android-only. The iOS background uploader is a documented gap; the app must not be presented as having Android-equivalent iOS upload behavior.
+The app has an Android WorkManager upload workflow. It is not an equivalent iOS background uploader. The Android worker is scheduled **after** photo preparation; compression itself still runs in the React Native JavaScript workflow.
 
-## What the app does
+## Features
 
-- Compose a report with a required description and one to five photos, using the camera or photo library.
-- Save a report to the local queue before preparing or sending its photos.
-- Compress selected photos and verify each final file is no larger than 5,000,000 bytes.
-- Upload photos and the report row to Supabase.
-- Show local save/upload progress, per-photo status, and actionable failures.
-- Fetch server history from Supabase separately from the local queue.
-- Retry failed reports and resume eligible work when connectivity returns or the app is opened again.
-- Clear local report history and local compressed copies without deleting server records.
+- Take photos with the camera or select them from the photo library.
+- Validate the description and one-to-five-photo limit.
+- Save reports locally before preparing or sending photos.
+- Compress photos to JPEG and enforce the 5,000,000-byte per-photo limit.
+- Upload photos and then the report row to Supabase.
+- Display local queue status, per-photo progress, offline state, server history, and retryable/permanent failures.
+- Retry failed reports and resume queue work when connectivity returns or the app is opened or foregrounded.
+- Clear local reports and compressed photo copies without deleting server rows or Storage objects.
 
+## Requirements
 
-## Technical-test acceptance scenario
+- Node.js `>=22.11.0` (see `package.json`).
+- Android Studio/Android SDK and the Java version required by this repository's Gradle/React Native toolchain.
+- A physical Android device or emulator for running and background-behavior testing.
+- A Supabase project and its project URL and publishable/anon key.
 
-The brief's primary scenario is to enable airplane mode, save three reports (including one report with five camera photos), force-quit and reopen the app, restore a throttled connection, interrupt it twice during upload, and verify that the server eventually contains all three reports and their photos.
+## Run the app
 
- 
+Install dependencies:
+
+```powershell
+npm install
+```
+
+Create `.env` from `.env.example` and set the project URL and **publishable/anon key**:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Never put a Supabase secret or service-role key in the mobile app or `.env`.
+
+Start Metro in one terminal:
+
+```powershell
+npm start
+```
+
+With an Android device/emulator connected, build and launch in another terminal:
+
+```powershell
+npm run android
+```
+
+Alternatively, build the debug APK from the `android` directory:
+
+```powershell
+Set-Location android
+.\gradlew.bat :app:assembleDebug
+```
 
 ## Supabase setup
 
 1. Create a Supabase project.
 2. Create a **public** Storage bucket named `field-reports`.
 3. Create the reports table and test policies below.
-4. Copy `.env.example` to `.env` and set `SUPABASE_URL` and `SUPABASE_ANON_KEY` to the project URL and publishable/anon key.
-5. Rebuild the app.
+4. Put the project URL and publishable/anon key in `.env`, then rebuild the app.
 
-The table used by the app:
+The app expects this table shape:
 
 ```sql
 create table public.reports (
@@ -62,82 +96,71 @@ create policy "field report photos can be checked for idempotent upload"
   using (bucket_id = 'field-reports');
 ```
 
-These permissive policies and a public bucket are for this technical test only. They are not a production authorization design. A production app should authenticate users and restrict report rows, object paths, and upload rates. Never put a Supabase secret or service-role key in the mobile app; use only the publishable/anon key.
+These permissive policies and a public bucket are for a technical test only, not a production authorization design. A production app should authenticate users and restrict report rows, object paths, and upload rates. Only the publishable/anon key belongs in the client.
 
-## How to make failures happen
+## End-to-end upload flow
 
-The brief asks that failure be testable on demand. Use a test project, not production data.
+1. The user submits the description and selected photo URIs. The queue validates the description and photo count and persists the report locally.
+2. While the app's JavaScript workflow is running, `QueueManager` compresses each image. `ImageCompressor` tries JPEG quality/dimension settings, checks the resulting size, and copies accepted images to the app documents directory. The report's prepared image paths and sizes are saved in the local queue.
+3. **After all photos are prepared**, `BackgroundUploadAdapter` gives the report metadata and durable compressed-file paths to the Android native bridge. The bridge enqueues one uniquely named WorkManager request per report.
+4. The native worker uploads that report's photos sequentially to deterministic paths under `field-reports/reports/<report-id>/<photo-index>.<extension>`. It uses replace-on-retry semantics and reports the active photo and progress through WorkManager.
+5. Only after every photo receives a successful HTTP response does the worker upsert the report row in Supabase. Work is reported successful only when that request also receives a successful HTTP response.
+6. If JavaScript remains available, it polls native progress for the UI. When the app is opened or returns to the foreground, the queue reads WorkManager status and reconciles completed photos, report URLs, and final status into local storage.
 
-### Offline and interrupted connection
-
-- Turn on airplane mode, save one or more reports, and confirm they appear in **On this device** without claiming they have uploaded.
-- Restore Wifi and observe the upload status.
-- While a photo is transferring, disable the active connection and then restore it.
-
- 
-
-## Architecture and implementation decisions
-
-### Ownership boundaries
-
-- `QueueManager` is a screen-independent TypeScript class. It owns report validation, local queue lifecycle, image-preparation orchestration, state transitions, retry classification, and retry timing.
-- `StorageAdapter` persists queue records through AsyncStorage. Compressed image files are stored in the app documents directory and are removed when local history is cleared.
-- `ImageCompressor` is a TypeScript adapter around `react-native-compressor`. It applies a JPEG quality/dimension policy, checks the actual file size, and persists the accepted result through `react-native-fs`.
-- `NetworkMonitor` wraps NetInfo. A network transition to online asks the queue manager to resume work.
-- `UploadAdapter` isolates network upload from the queue manager and UI. The manager can be tested using fake storage, compressor, network, and uploader adapters without rendering React components.
-- The screen renders queue records from local storage and server history from a separate Supabase query. A local “saved” state and a server “uploaded” state are deliberately distinct.
-
-### Image preparation
-
-The app accepts large originals as input. For each photo, TypeScript asks the compressor to produce JPEG output, starting at up to 2048 pixels and trying decreasing quality values. If needed, it reduces the dimension and tries again down to 512 pixels. It verifies the produced file and its durable copy against the hard limit of 5,000,000 bytes before allowing upload.
-
-The compression library uses platform image APIs internally, but the queue and compression policy are orchestrated in TypeScript. Android's WorkManager worker does not compress, resize, or make image-quality decisions. Compression can take time and may use device resources; the queue record is saved before compression begins.
-
-### Android background file transfer
-
-`BackgroundUploadAdapter` is the only queue component that calls the Android native transfer bridge. After TypeScript has compressed and durably saved every photo, the bridge schedules one uniquely named WorkManager task for the entire report. The native worker uploads those prepared files sequentially, records per-photo progress, and submits the report row to Supabase only after every photo upload succeeds. The task uses the configured publishable/anon key in both the `apikey` and `Authorization: Bearer` headers.
-
-WorkManager owns this complete Android workflow, so it does not depend on the React Native JavaScript runtime remaining alive after scheduling. When the app is opened or returns to the foreground, the queue reads native work status and reconciles its local report and photo state. WorkManager retries eligible network and transient server failures; the TypeScript queue preserves the report, handles surfaced failures/backoff, and provides user-triggered retries. Compression remains in TypeScript and completes before any native work is scheduled.
-
-### Retry and duplicate behavior
-
-- Network/transport failures, timeouts, HTTP 408, 425, 429, and HTTP 5xx are retryable. The durable worker applies WorkManager backoff while it is active; a surfaced terminal failure remains available for queue retry.
-- Other HTTP failures are surfaced as permanent until the user chooses **Try again**.
-- Each photo uses a deterministic Storage object path based on report ID and photo index, with replace enabled. A retry may transfer the same photo again, but it replaces the same object rather than creating a second path.
-- Each report has a stable client-generated ID in the table primary key. The report row is upserted on that ID, so a retry after an uncertain response updates the same row.
-
-This prevents duplicate logical report rows and duplicate object paths when the configured backend honors upsert/replace semantics. It is not a claim that the network can never send the same bytes more than once.
-
-### Local history and reset semantics
-
-The **On this device** list represents local queue records. **Received by server** is fetched from Supabase and is not inferred from the local queue. **Clear** cancels report transfers and removes local queue data and compressed copies; it does not delete already-uploaded server rows or Storage objects. The confirmation text explains that pending local work will be discarded.
+The native requests use the configured publishable/anon key in the `apikey` header and `Authorization: Bearer <publishable/anon key>`. No service-role key is embedded or logged.
 
  
+
+## Queue, retries, and duplicate handling
+
+- Queue records are stored in AsyncStorage. Compressed copies are stored under the app documents directory.
+- Offline reports remain local and are eligible for processing when connectivity returns.
+- WorkManager waits for a connected network and retries transport failures and transient HTTP responses (408, 425, 429, and 5xx) with exponential backoff. Other HTTP failures are surfaced as permanent until the user retries.
+- The TypeScript queue retains failed report details, provides retry behavior, and reconciles native work status on resume/reopen.
+- Photo paths are deterministic per report ID and image index; the Storage request enables replacement. The report row is upserted using the stable report ID. A retry may send bytes again, but it targets the same object path and logical report row.
+- A report row is never sent after a failed photo upload. If the report-row request fails after all photos succeeded, a retry can replace those same photo objects and upsert the same report ID.
+- **Clear** cancels tagged native work and clears local records and compressed copies. It does not remove already-uploaded Storage objects or server rows.
+
+These measures provide idempotent targets when the backend honors the configured upsert/replace policies; they do not guarantee that the network transmits bytes only once.
+
+## Making failures testable
+
+Use a disposable Supabase project, never production data.
+
+- **Offline / connection interruption:** enable airplane mode before saving to test local queue behavior. Restore connectivity to trigger processing. During an upload, disable the connection and restore it to exercise network constraints and retry behavior.
+- **Permanent authorization error:** temporarily revoke the relevant Storage or reports-table test policy, attempt an upload, and confirm the HTTP error is surfaced instead of silently marked successful. Restore the policy afterward.
+- **Transient failure or hang:** use a controllable network proxy or test environment capable of returning a 5xx, delaying a response, or dropping a connection. There is no built-in fault-injection server/proxy in this repository.
+- **Validation:** try a blank description, zero photos, and six photos. Also try a large original and verify the compressed file stays under 5,000,000 bytes.
+- **Permissions:** deny camera/photo access, then grant it from Settings and try again without restarting.
+- **Reset:** clear local history and confirm local records and compressed copies are removed while server records remain.
+
+For emulator/device network shaping, use the Android Emulator's network controls or a device-compatible proxy. Exact controls differ by Android Studio/device version.
+
  
-## Verification
+### Manual Android scenario
 
-1. Queue three reports in airplane mode, including a report with five large camera photos.
-2. Minimize the app while a multi-photo report is uploading, then reopen it and confirm native progress and final queue state are reconciled. Force-stop is different: Android stops the app and does not guarantee scheduled work will run until the user launches the app again; behavior after reopening can vary by Android version and device manufacturer.
-3. Drop the connection twice during upload.
-4. Confirm every stored photo is at most 5,000,000 bytes and visually usable, and verify one report row per report ID in Supabase.
-5. Deny camera/photo permissions, grant them later in Settings, and retry without restarting.
-6. Try an empty description, zero photos, and a sixth photo.
-7. Test a permanent authorization failure, a transient server error, and a hanging request. Confirm only retryable errors are automatically retried.
-8. Clear local history and verify that the documented local-only reset behavior matches the backend.
+1. Use a test Supabase project and save several reports while offline, including one report with five camera photos.
+2. Restore connectivity and observe the local per-photo progress and separate server history.
+3. Minimize the app **after confirming preparation has finished and the report is uploading**. Reopen it and confirm the queue reconciles native progress and final status.
+4. Interrupt and restore the connection during upload; verify retry behavior and confirm every row/photo is present in Supabase.
+5. Test minimizing during preparation separately. This is a known gap: WorkManager has not yet been scheduled at that point.
+6. Test Android force-stop separately from minimizing. Force-stop is an OS-enforced stopped state; WorkManager execution is not guaranteed until the user launches the app again. Behavior can also vary by Android version and device manufacturer.
 
-Automated tests and a successful Android build do not prove real carrier connectivity, force-stop behavior across Android versions, or backend policy correctness.
+Real-device background behavior, force-stop recovery, carrier/2G reliability, and backend policy correctness have not been verified by the automated test suite.
 
-## Decisions, trade-offs, and next steps
+## Architecture and decisions
 
-- **Why Supabase:** it provides a real Storage upload and report-table round trip without spending the limited test time building a custom server. The open test policies are intentionally not presented as production-ready.
-- **Why an adapter-based TypeScript queue:** it keeps report decisions testable without mounting screens and keeps queue logic independent of WorkManager APIs.
-- **Why WorkManager:** the Android brief calls for durable background file transfer. A native scheduler can run eligible work outside the foreground React Native UI; JavaScript alone cannot guarantee that work continues after its runtime is stopped.
-- **Why keep native code small:** Android owns the durable per-report upload and report-row request, plus WorkManager status. TypeScript retains validation, compression policy, local queue decisions, and UI-facing retry behavior.
-- **With another day:** implement and test the iOS background `URLSession` bridge; add deterministic integration tests against a controllable backend; improve process-death recovery and observability; run throttled-network and carrier tests on multiple Android versions/devices; and record the requested two-to-three-minute airplane-mode-to-server demo.
-- **Known omissions:** no iOS background uploader, no built-in fault-injection server/proxy, and no production authentication or restrictive per-user backend policies. Android force-stop, device-specific background restrictions, and real network behavior still require device testing; this implementation does not claim equivalent iOS background support.
+- **`QueueManager`** owns local report validation and lifecycle, compression orchestration, state transitions, retry classification, and TypeScript retry timing. It is testable without mounting a screen through injected storage, compressor, network, and uploader adapters.
+- **`ReportStorageAdapter`** persists queue records through AsyncStorage and removes compressed local copies when reports are cleared.
+- **`ImageCompressor`** wraps `react-native-compressor` and `react-native-fs`. It emits JPEG output, tries dimensions from up to 2048 downward while staying at or above 512 and quality steps from 0.88 down to 0.4, and enforces the 5,000,000-byte maximum.  
+- **`BackgroundUploadAdapter`** prepares the bridge payload, schedules Android report work, reads progress/results, and exposes cancellation/reconciliation to the queue.
+- **`BackgroundTransferModule` and `ReportUploadWorker`** own one durable Android job per report. The worker performs the sequential Storage requests and final Supabase REST upsert without requiring an active JavaScript runtime.
+- **`NetInfoMonitor`** informs the queue of connectivity changes. Server history is fetched separately from the local queue.
+- **UI and reset semantics:** “On this device” is local queue state; “Received by server” is fetched from Supabase. A local save is not proof of server delivery.
+- **Why this boundary:** keeping queue state and image preparation in TypeScript is testable and preserves the existing compression behavior. Moving the complete upload sequence and final row request into WorkManager removes the JavaScript dependency after scheduling.  
 
-## Submission checklist
+## Known gaps and next steps
 
-- Source repository with meaningful commit history.
-- This README with setup steps, backend setup/failure testing, design reasoning, and documented gaps.
-- A two-to-three-minute screen recording. A useful walkthrough is: save reports offline; show they are locally saved rather than uploaded; reopen/restore a throttled connection; show progress and the separate server list updating; interrupt and recover a transfer; then show the final rows/photos in Supabase.
+- Android force-stop and manufacturer-specific background restrictions can defer WorkManager execution; this has not been validated on a device.
+- No equivalent iOS background upload implementation is included.
+- The provided Supabase schema/policies are intentionally permissive test policies, not production authentication or authorization.
